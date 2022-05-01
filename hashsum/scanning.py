@@ -1,31 +1,23 @@
-import atexit
-from collections import OrderedDict
-from datetime import datetime, date
-
-from hashsum import utils, REPORT_FILENAME, REPORT_TITLE, SCAN_PATH_WILDCARD
-from hashsum import SCAN_WORKERS, FILE_CHUNKSIZE, LOAD_CHUNKSIZE, IS_WINDOWS, SYSTEM_ROOT, TORCH_REQUIRED
-from hashsum.database import HashDatabase, BaseDatabase, DatabaseResult, NNDatabase
-from hashsum.errors import ScanError, READ_ERRORS
-
-from multiprocessing import Pool
-from multiprocessing import Lock, Queue
-from threading import Thread
-
+from hashsum import SCAN_WORKERS, TORCH_REQUIRED, FILE_CHUNKSIZE, SCAN_CHUNKSIZE, IS_WINDOWS, SYSTEM_ROOT, \
+    UPDATE_WORKERS
+from hashsum import utils
+from hashsum.database import BaseDatabase, DatabaseResult
+from hashsum.errors import READ_ERRORS, ScanError
+from typing import List, Iterator, Iterable, Callable, Any, Union, Tuple
+from threading import Thread, Lock
+from queue import Queue
+from concurrent.futures import ProcessPoolExecutor, Future
 from functools import partial
-from typing import Iterator, Any, List, Iterable, Callable, Union
-from collections.abc import Generator
 
+import sys
+import atexit
+import itertools
+import pickle
 import os
-import time
-import zipfile
-import tarfile
-import psutil
-import logging
+import multiprocessing as mp
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+_SENTINEL = object()
 
-_DISPLAY = False
 _DAY = 24
 _FIVE_DAYS = 5 * _DAY
 
@@ -50,79 +42,27 @@ def _set_scan(func):
     return wrapper
 
 
-def _get_paths(query_path) -> Iterator[str]:
-    return iter(query_path.load())
+def _process_chunk(chunk: Iterable[str], calc_func: Callable[[str, Any], Any], calc_args: tuple,
+                   calc_kwargs: dict, pipe_conn: mp.connection.PipeConnection):
+    for file in chunk:
+        pipe_conn.send(calc_func(file, *calc_args, **calc_kwargs))
 
 
-class _ScanQueryPath(str):
-    def __new__(cls, path: str, load_func: Callable, *load_args, **load_kwargs):
-        obj = str.__new__(cls, path)
-        obj.load_func = load_func
-        obj.load_args = load_args
-        obj.load_kwargs = load_kwargs
-        return obj
+class _FileIterator(object):
+    def __init__(self, paths: List[str], file_iterator: Callable[[Iterable[str]], Iterator[str]],
+                 scan_memory: bool, log_errors: bool):
+        self.paths = paths
+        self.file_iterator = file_iterator
+        self.scan_memory = scan_memory
+        self.log_errors = log_errors
+        self.lock = Lock()
 
-    def load(self) -> Iterator[str]:
-        if not self.load_func: return []
-        return iter(self.load_func(str(self), *self.load_args, **self.load_kwargs))
-
-
-class ScanQuery(list):
-    def __init__(self, paths: str or 'ScanQuery' = None, load_func: Callable = None, memory=False, print_errors=False,
-                 load_while_scanning=True, pool_workers=SCAN_WORKERS, **load_kwargs):
-        if not paths: paths = []
-        if not load_func: load_func = utils.all_files
-
-        if (paths or load_func) and memory and print_errors:
-            raise UserWarning('Paths will be extended with memory files as argument memory=True.')
-        elif not paths and not load_func and not memory:
-            raise ValueError('Either a path, list of paths, or memory=True should be provided as arguments.')
-
-        paths = list(utils.traverse(paths, tree_types=(ScanQuery, tuple, list)))
-        all_paths = self.__to_query_paths(paths, load_func, **load_kwargs)
-        all_paths.extend(list(filter(lambda x: isinstance(x, ScanQuery), paths)))
-        list.__init__(self, all_paths)
-        self.memory = memory
-        self.load_while_scanning = load_while_scanning
-        self.pool_workers = pool_workers
-        self.print_errors = print_errors
-
-    @staticmethod
-    def __to_query_paths(paths: Iterable[Any], load_func: Callable = None,
-                         *load_args, **load_kwargs) -> List[_ScanQueryPath]:
-        temp = []
-        for path in paths:
-            if isinstance(path, str) and not isinstance(path, _ScanQueryPath):
-                p = _ScanQueryPath(path, load_func, *load_args, **load_kwargs)
-            else:
-                p = path
-            temp.append(p)
-
-        return temp
-
-    def load(self) -> Iterator[str] or List[str]:
-        if self.load_while_scanning:
-            with Pool(self.pool_workers) as pool:
-                for paths in pool.imap_unordered(_get_paths, self):
-                    for path in paths: yield path
-
-            if self.memory:
-                for path in get_mem_files(display_error=self.print_errors): yield path
-
-        else:
-            paths = []
-            for path in self: paths.extend(_get_paths(path))
-            if self.memory: paths.extend([path for path in get_mem_files(display_error=self.print_errors)])
-
-            return paths
-
-
-def recent_query(path, *args, **kwargs):
-    return ScanQuery(path, load_func=utils.recent_modified_files, *args, **kwargs)
-
-
-def random_query(path, *args, **kwargs):
-    return ScanQuery(path, load_func=utils.random_files, *args, **kwargs)
+    def __iter__(self):
+        with self.lock:
+            if self.paths:
+                yield from self.file_iterator(self.paths)
+            if self.scan_memory:
+                yield from self.file_iterator(utils.get_mem_files(self.log_errors))
 
 
 class BaseScanner(object):
@@ -131,37 +71,37 @@ class BaseScanner(object):
     STATE_SCANNING = 2
     STATE_STOPPING = 3
 
-    def __init__(self, database: BaseDatabase) -> None:
+    def __init__(self, database: BaseDatabase = None):
         self._state = self.STATE_IDLE
-        self.database = database
-        self._lock = Lock()
-        self.__q = Queue()
-        self.__put_q = None
-        self.__t = None
-        self.infected = []
-        self.files = []
-        self.all_files = []
-        self.not_scanned = []
-        self.results = []
-        self.__query = None
-        self.__scan_load = False
-        self.connect(database)
-
-    def reset_vars(self):
-        self.infected = []
-        self.files = []
-        self.all_files = []
-        self.not_scanned = []
-        self.results = []
-
-    @property
-    def is_connected(self):
-        return self.__put_q is not None
+        self.__result_q = Queue()
+        self.__lookup_q = None
+        self._scan_thread = None
+        self._db_type = None
+        self._file_iter = []
+        self._results = []
+        if database:
+            self.connect(database)
 
     def connect(self, database: BaseDatabase) -> None:
-        self.__put_q = database.connect(self.__q)
+        self._db_type = type(database)
+        self.__lookup_q = database.connect(self.__result_q)
         database.start_lookup()
-        atexit.register(database.stop_lookup, block=True)
+
+    def _reset_vars(self):
+        self._file_iter = []
+        self._results = []
+
+    @property
+    def is_connected(self) -> bool:
+        return self.__lookup_q is not None
+
+    @property
+    def file_iter(self):
+        return iter(self._file_iter)
+
+    @property
+    def results(self):
+        return self._results.copy()
 
     @property
     def state(self) -> int:
@@ -175,530 +115,389 @@ class BaseScanner(object):
 
     def __check_connected(self):
         if not self.is_connected:
-            raise ValueError('The scanner is not connected to a database, submission is not available.')
+            raise ValueError('The scanner is not connected to a database, lookup is not available.')
 
-    def _submit(self, path):
-        self.__check_connected()
-        self.__put_q.put(path)
+    def _submit(self, lookup_args):
+        # self.__check_connected()
+        self.__lookup_q.put(lookup_args)
 
     def _get_result(self, block=True) -> DatabaseResult:
-        self.__check_connected()
-        return self.__q.get(block)
+        # self.__check_connected()
+        return self.__result_q.get(block)
+
+    def scan(self, *args, **kwargs):
+        self._reset_state()
+        self._reset_vars()
 
 
 class Scanner(BaseScanner):
-    def __init__(self, database: BaseDatabase, workers: int = SCAN_WORKERS, file_chunksize: int = FILE_CHUNKSIZE,
-                 load_chunksize: int = LOAD_CHUNKSIZE, scan_archives=True, print_errors=False):
-        BaseScanner.__init__(self, database)
+    def __init__(self, database: BaseDatabase = None, workers: int = SCAN_WORKERS, scan_chunksize: int = None,
+                 log_errors=False, *calc_args, **calc_kwargs):
+        super().__init__(database)
         self.workers = workers
-        self.file_chunksize = file_chunksize
-        self.load_chunksize = load_chunksize
-        self.scan_archives = scan_archives
-        self.print_errors = print_errors
-        self._start_time = None
-        self.elapsed_time = 0
-        self.__scan_generator = None
-
-    def __scan_archive(self, path: str, *args, **kwargs) -> List:
-        results = []
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path) as archive:
-                for file in archive.namelist():
-                    results.append(self.__scan_path(path=file, _is_archive=True, zipfile=archive, *args, **kwargs))
-
-        elif tarfile.is_tarfile(path):
-            with tarfile.TarFile(path) as archive:
-                for file in archive.getmembers():
-                    results.append(self.__scan_path(path=file, _is_archive=True, tarfile=archive, *args, **kwargs))
-
-        return results
-
-    def __scan_path(self, thread_safe: bool, scan_calc: bool, multi_lookup: bool, path,
-                    _is_archive=False, *calc_args, **calc_kwargs) -> List[Union[DatabaseResult, None]]:
-        results = []
-        result = None
-        if self.state != self.STATE_SCANNING: return results
-
-        if not _is_archive and not os.path.isfile(path):
-            self.not_scanned.append(path)
-            if self.print_errors: print(f'The file {path} does not exist.')
-            return results
-
-        try:
-            if not _is_archive and self.scan_archives:
-                results = self.__scan_archive(path, thread_safe, scan_calc, multi_lookup)
-
-            if scan_calc:
-                item = self.database.do_calc(path, *calc_args, **calc_kwargs)
-            else:
-                item = path
-            if thread_safe:
-                result = self.database.lookup(*item, *calc_args, **calc_kwargs)
-            else:
-                self._submit(item)
-                result = self._get_result()
-        except READ_ERRORS as e:
-            self.not_scanned.append(path)
-            if self.print_errors: print(f'Failed to read file {path}: {e}')
-            return results
-
-        if result is not None:
-            results.append(result)
-            if result.error: self.not_scanned.append(path)
-        else:
-            self.not_scanned.append(path)
-        results = list(utils.traverse(list(filter(lambda x: x is not None, results))))
-        if not _is_archive:
-            self.results.extend(results)
-            self.files.append(path)
-            self.infected.extend(list(filter(lambda x: x.malicious, results)))
-
-        return results
-
-    @_set_scan
-    def __iter_results(self) -> Iterator[DatabaseResult or None]:
-        broke = False
-        with Pool(self.workers) as pool:
-            for results in pool.imap_unordered(partial(self.__scan_path, self.database.thread_safe,
-                                                       self.database.scan_side_calc, self.database.multi_lookup),
-                                               self.__scan_generator(), chunksize=self.file_chunksize):
-                for result in results:
-                    if self.state == self.STATE_STOPPING:
-                        broke = True
-                        break
-                    yield result
-
-                if broke: break
-
-            pool.close()
-            pool.join()
-
-        self.__t = None
-        self.elapsed_time = utils.timesince(self._start_time)
-
-    def __scan(self) -> None:
-        for _ in self.__iter_results(): pass
-        self._reset_state()
-
-    def __scan_iter(self) -> Iterator[DatabaseResult or None]:
-        for result in self.__iter_results():
-            if result:
-                yield result
-        self._reset_state()
-
-    def __query_generator(self, query: ScanQuery = None) -> Iterator[str]:
-        if query is not None:
-            for path in query.load():
-                self.all_files.append(path)
-                yield path
-        else:
-            return iter(self.all_files)
-
-    def __start_scan(self, query: ScanQuery):
-        self._set_state(self.STATE_SCANNING)
-        self.reset_vars()
-        if query is None: raise ValueError('Empty Scan Query provided')
-        import pdb; pdb.set_trace()
-        self.__scan_load = query.load_while_scanning
-        if not self.__scan_load:
-            self._set_state(self.STATE_LOAD_PATHS)
-            self.all_files = list(query.load())
-            if not self.all_files:
-                return False
-
-            self.__scan_generator = self.__query_generator
-
-            if not self.file_chunksize:
-                self.file_chunksize = len(self.all_files) // self.workers
-        else:
-            self.file_chunksize = 1
-            self.__scan_generator = lambda: self.__query_generator(query)
-
-        self._set_state(self.STATE_SCANNING)
-        self._start_time = time.time()
-        return True
+        self.scan_chunksize = scan_chunksize
+        self.log_errors = log_errors
+        self.calc_args = calc_args
+        self.calc_kwargs = calc_kwargs
 
     @staticmethod
-    def __get_query(query: ScanQuery = None, *args, **kwargs):
-        if not args and query is None:
-            raise ValueError('Either scan query args or a Scan Query object must be provided as arguments')
+    def __submit_paths(calc_func: Callable[[str, Any], Any], calc_args: tuple, calc_kwargs: dict,
+                       future_q: Queue, done_q: Queue, files: Iterable[str], executor: ProcessPoolExecutor):
+        for file in files:
+            if not done_q.empty():
+                done_q.get()
+                break
+            try:
+                future_q.put(executor.submit(calc_func, file, *calc_args, **calc_kwargs))
+            except RuntimeError:
+                break
+        else:
+            future_q.put(_SENTINEL)
 
-        if query is None:
-            query = ScanQuery(*args, **kwargs)
-        elif isinstance(query, str):
-            query = ScanQuery(query, *args, **kwargs)
+    def scan(self, paths: List[str] = None, scan_memory=False,
+             file_iterator: Callable[[Iterable[str]], Iterator[str]] = utils.iter_all_files,
+             load_paths_while_scanning=False, *calc_args, **calc_kwargs) -> Iterator[DatabaseResult]:
+        if not paths and not scan_memory:
+            raise ValueError('No paths or memory to scan.')
 
-        return query
+        super().scan()
+        self._set_state(self.STATE_LOAD_PATHS)
 
-    def _scan(self, query: ScanQuery):
-        if self.__start_scan(query):
-            self.__scan()
+        files = _FileIterator(paths, file_iterator, scan_memory, self.log_errors)
+        if not load_paths_while_scanning:
+            files = list(files)
+            if self.scan_chunksize:
+                chunksize = self.scan_chunksize
+            else:
+                chunksize, extra = divmod(len(files), self.workers)
+                if extra:
+                    chunksize += 1
 
-    def scan(self, query: ScanQuery = None, *args, **kwargs) -> Iterator[Union[DatabaseResult, None]]:
-        query = self.__get_query(query, *args, **kwargs)
-        if self.__start_scan(query):
-            return iter(self.__scan_iter())
+            chunks = list(utils.iter_chunks(chunksize, files))
+            # print(f'Created chunks of size {chunksize}\n')
+        self._file_iter = files
 
-    def scan_async(self, query: ScanQuery = None, *args, **kwargs):
-        query = self.__get_query(query, *args, **kwargs)
-        self.__t = Thread(target=self._scan, args=(query,), daemon=True)
-        self.__t.start()
+        self._set_state(self.STATE_SCANNING)
+        with ProcessPoolExecutor(max_workers=self.workers) as executor:
+            if load_paths_while_scanning:
+                result_q = Queue()
+                done_q = Queue()
+                submit_thread = Thread(
+                    target=self.__submit_paths,
+                    args=(self._db_type.do_calc, calc_args, calc_kwargs, result_q, done_q, files, executor),
+                    daemon=True
+                )
+                submit_thread.start()
+                fs = []
+
+                paths_done = False
+                while self.state == self.STATE_SCANNING and not (paths_done and not len(fs)):
+                    if not paths_done:
+                        future = result_q.get()
+                        if future is _SENTINEL:
+                            paths_done = True
+                        else:
+                            fs.append(future)
+
+                    done_futures = []
+                    for future in fs:
+                        if future.done():
+                            self._submit(future.result())
+                            result = self._get_result()
+                            yield result
+                            self._results.append(result)
+                            done_futures.append(future)
+
+                    # remove futures that have been completed
+                    fs = [f for f in fs if f not in done_futures]
+
+                if self.state != self.STATE_SCANNING:
+                    for future in fs:
+                        future.cancel()
+                    done_q.put(_SENTINEL)
+                submit_thread.join()
+
+            else:
+                parent_conn, child_conn = mp.Pipe()
+                fs = [executor.submit(
+                    _process_chunk, chunk, self._db_type.do_calc, calc_args, calc_kwargs, child_conn
+                ) for chunk in chunks]
+
+                while self.state == self.STATE_SCANNING and not (all([f.done() for f in fs])) and not child_conn.poll():
+                    self._submit(parent_conn.recv())
+                    result = self._get_result()
+                    yield result
+                    self._results.append(result)
+
+                if self.state != self.STATE_SCANNING:
+                    for f in fs:
+                        f.cancel()
+                else:
+                    for future in fs:
+                        future.result()
+                parent_conn.close()
+                child_conn.close()
+
+        self._set_state(self.STATE_IDLE)
+
+    def scan_async(self, *args, scan_func: Callable = None, **kwargs):
+        if not scan_func: scan_func = self.scan
+        self._scan_thread = Thread(target=scan_func, args=args, kwargs=kwargs, daemon=True)
+        self._scan_thread.start()
 
     def stop_scan(self, block=True):
+        if self.state == self.STATE_STOPPING or self.state == self.STATE_IDLE:
+            return
+
         self._set_state(self.STATE_STOPPING)
-        if block and self.__t is not None: self.__t.join()
+        if block and self._scan_thread is not None:
+            self._scan_thread.join()
+        self._scan_thread = None
 
-    def generate_report(self, report_file: str = None, verbose: bool = False):
-        if not report_file:
-            report_file = f'{date.today()}-{REPORT_FILENAME}'
+    # -------- Scan types --------
+    def memory_scan(self, *args, **kwargs) -> Iterator[DatabaseResult]:
+        return self.scan(None, True, *args, **kwargs)
 
-        with open(report_file, 'w') as f:
-            f.write(f'{REPORT_TITLE}: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}\n\n')
-            f.write(f"Scanned files: {len(list(filter(lambda x: not x.details.get('in_archive'), self.results)))}\n\n")
-            f.write(f'Total items scanned (ex. in archive): {len(self.results)}\n\n')
-            f.write(f'Total scan time: {self.elapsed_time}\n\n')
-            f.write(f'Files not scanned: {len(self.not_scanned)}\n\n')
-            if verbose: f.write('Not scanned files:\n' + '\n'.join(self.not_scanned) + '\n\n')
-            if self.infected: f.write(f'Suspicious files ({len(self.infected)} found):\n' +
-                                      '\n'.join(self.infected) + '\n\n')
-            else: f.write('No suspicious files found.')
-            if verbose:
-                f.write('\n\nScan parameters:\n')
-                f.write(f'\tscan workers: {self.workers}\n')
-                f.write(f'\tfile chunksize (files per worker thread): {self.file_chunksize}\n')
-                f.write(f'\tscan archives: {self.scan_archives}\n')
+    def quick_scan(self, *args, **kwargs) -> Iterator[DatabaseResult]:
+        if IS_WINDOWS:
+            yield from self.scan([PROGRAM_FILES, PROGRAM_FILES_86], True,
+                                 file_iterator=partial(utils.iter_recent_files, hours=_DAY, modified=False, subdirs=True),
+                                 *args, **kwargs)
+            yield from self.scan([WINDOWS], False,
+                                 file_iterator=partial(utils.iter_recent_files, hours=_FIVE_DAYS, modified=False,
+                                                       subdirs=False),
+                                 *args, **kwargs)
+        else:
+            return self.scan([
+                os.path.join(SYSTEM_ROOT, 'bin'),
+                os.path.join(SYSTEM_ROOT, 'sbin'),
+                os.path.join(SYSTEM_ROOT, 'usr'),
+                os.path.join(SYSTEM_ROOT, 'home')
+            ], True,
+                file_iterator=partial(utils.iter_recent_files, _FIVE_DAYS, modified=False, subdirs=True),
+                *args, **kwargs)
 
-                f.write(f'\tdatabase:\n')
-                f.write(f'\t\ttype: {self.database.__class__.__name__}')
-                if hasattr(self.database, 'version'): f.write(f'\t\tversion: {self.database.version}\n')
-                if hasattr(self.database, 'signatures'): f.write(f'\t\tsignatures: {self.database.signatures}\n')
-                if hasattr(self.database, 'chunksize'): f.write(f'\t\tload chunksize: {self.database.chunksize}\n')
-                f.write(f'\t\tscan side calc: {self.database.scan_side_calc}\n')
-                f.write(f'\t\tmulti lookup: {self.database.multi_lookup}\n')
-                f.write(f'\t\tscan side calc: {self.database.scan_side_calc}\n')
+    def system_scan(self, *args, **kwargs) -> Iterator[DatabaseResult]:
+        return self.scan([SYSTEM_ROOT], True,
+                         file_iterator=partial(utils.iter_recent_files, _FIVE_DAYS * 2, modified=False, subdirs=True),
+                         *args, **kwargs)
 
-        return report_file
-
-
-def get_mem_files(display_error=False) -> Iterator[str]:
-    for proc in psutil.process_iter():
-        try:
-            yield proc.exe()
-            for path in map(lambda x: x.path, proc.open_files()): yield path
-        except psutil.Error as e:
-            if display_error:
-                print(e)
-            else:
-                continue
-
-
-def normal_scan(path: str) -> ScanQuery:
-    return ScanQuery(path, load_func=utils.all_files, subdirs=True, memory=False, load_while_scanning=False)
-
-
-def memory_scan() -> ScanQuery:
-    return ScanQuery(memory=True)
-
-
-def quick_scan() -> ScanQuery:
-    if IS_WINDOWS:
-        return ScanQuery(
-            [SYSTEM_ROOT,
-             WINDOWS,
-             recent_query(WINDOWS, hours=_FIVE_DAYS, subdirs=True),
-             recent_query(PROGRAM_FILES, hours=_DAY, subdirs=True),
-             recent_query(PROGRAM_FILES_86, hours=_DAY, subdirs=True)],
-            load_func=utils.all_files,
-            subdirs=False,
-            memory=True
-        )
-    else:
-        five_days = lambda path: recent_query(os.path.join(SYSTEM_ROOT, path), hours=_FIVE_DAYS, subdirs=True)
-        return ScanQuery(
-            [os.path.join(SYSTEM_ROOT, 'bin'),
-             five_days('bin'),
-             five_days('usr'),
-             five_days('home')],
-            load_func=utils.all_files,
-            subdirs=False,
-            memory=True
-        )
-
-
-def system_scan() -> ScanQuery:
-    if IS_WINDOWS:
-        return ScanQuery(
-            [SYSTEM_ROOT,
-             WINDOWS,
-             recent_query(SYSTEM_ROOT, hours=_FIVE_DAYS, subdirs=True)],
-            load_func=utils.all_files,
-            subdirs=False,
-            memory=True
-        )
-    else:
-        return ScanQuery(
-            [os.path.join(SYSTEM_ROOT, 'bin'),
-             os.path.join(SYSTEM_ROOT, 'sbin'),
-             recent_query(SYSTEM_ROOT, hours=_FIVE_DAYS, subdirs=True)],
-            load_func=utils.all_files,
-            subdirs=False,
-            memory=True
-        )
-
-
-SCAN_TYPES = OrderedDict({
-    'System Scan': (system_scan,),
-    'Quick Scan': (quick_scan,),
-    'Memory Scan': (memory_scan,),
-    'Recently Modified Files Scan': (recent_query, SCAN_PATH_WILDCARD, 'hours last modified'),
-    'Random Files Scan': (random_query, SCAN_PATH_WILDCARD, 'number of files')
-})
+    def recent_scan(self, paths: List[str] = None, *args, **kwargs) -> Iterator[DatabaseResult]:
+        return self.scan(paths, scan_memory=paths is None,
+                         file_iterator=partial(utils.iter_recent_files, _DAY, modified=False, subdirs=True),
+                         *args, **kwargs)
 
 
 def _get_args(db_types: List[str], scan_types: List[str]):
     from hashsum import DATABASE_WORKERS, UPDATE_CHUNKSIZE
     import argparse
 
-    parser = argparse.ArgumentParser(argparse.ArgumentDefaultsHelpFormatter, description='Command line HashSum '
-                                                                                         'interface.')
-    parser.add_argument('--display-text', '-d', action='store_true', default=False, help='display scan result '
-                                                                                         'for each individual '
-                                                                                         'item')
-    parser.add_argument('--database', '-db', choices=db_types, default=db_types[0], help='type of database to '
-                                                                                         'use for scanning')
-    parser.add_argument('--scan-workers', '-sw', type=int, default=SCAN_WORKERS, help='number of worker threads '
-                                                                                      'to use in the scanning '
-                                                                                      'threadpool. WARNING: '
-                                                                                      'settings a high value may '
-                                                                                      'crash device')
-    parser.add_argument('--update-workers', '-uw', type=int, default=DATABASE_WORKERS, help='number of update '
-                                                                                            'workers to use for '
-                                                                                            'updating database, '
-                                                                                            'etc. WARNING: '
-                                                                                            'setting a high value '
-                                                                                            'may crash device')
-    parser.add_argument('--update-chunksize', '-uc', type=int, default=UPDATE_CHUNKSIZE, help='number of files to '
-                                                                                              'dedicate to each '
-                                                                                              'thread of a database '
-                                                                                              'update')
-    parser.add_argument('--update-database', '-u', action='store_true', default=False, help='update the database')
-    parser.add_argument('--file-chunksize', '-f', type=int, default=FILE_CHUNKSIZE, help='number of files per '
-                                                                                         'threadpool'
-                                                                                         'thread for '
-                                                                                         'scanning. None for '
-                                                                                         'automatic selection of '
-                                                                                         'chunksize')
-    parser.add_argument('--scan-load-chunksize', '-lc', type=int, default=LOAD_CHUNKSIZE, help='number of bytes to '
-                                                                                               'load per iteration '
-                                                                                               'for each file during '
-                                                                                               'scanning to prevent '
-                                                                                               'potential memory '
-                                                                                               'crash. None for '
-                                                                                               'loading files all at '
-                                                                                               'once')
-    parser.add_argument('--scan-type', '-st', choices=scan_types, default=scan_types[0],
-                        help='type of scan to performs')
-    parser.add_argument('--path', '-p', type=str, default=None, help='the path to scan (only applicable for '
-                                                                     '--scan-type={})'.format(scan_types[0]))
-    parser.add_argument('--no-gpu', '-g', action='store_true', default=False, help='disable use GPU when applicable ('
-                                                                                   'such as for neural-network '
-                                                                                   'based databases)')
-    parser.add_argument('--no-scan-side-calc', '-nc', action='store_true', default=False, help='disable thread-side '
-                                                                                               'calculations for '
-                                                                                               'individual files')
-    parser.add_argument('--log-level', '-l', choices=['info'])
-    parser.add_argument('--run-cli', '-cli', action='store_true', default=False, help='run the command line interface '
-                                                                                      '(CLI)')
-    parser.add_argument('--no-display-infected', '-ni', action='store_true', default=False, help='disable printing of '
-                                                                                                 'infected file '
-                                                                                                 'results '
-                                                                                                 'at the end of a scan '
-                                                                                                 'when not using CLI')
-    parser.add_argument('--no-scan-archives', '-na', action='store_true', default=False, help='disable the scanning '
-                                                                                              'of archives during '
-                                                                                              'scanning')
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+                                     description='HashSum command line interface.')
+    parser.add_argument('--display-results', '-d', action='store_true', default=False,
+                        help='display scan result for each individual item')
+    parser.add_argument('--database', '-db', choices=db_types, default=db_types[0],
+                        help='type of database to use for scanning')
+    parser.add_argument('--db-workers', '-dw', type=int, default=DATABASE_WORKERS,
+                        help='number of database workers to use for lookup')
+    parser.add_argument('--scan-workers', '-sw', type=int, default=SCAN_WORKERS,
+                        help='number of worker process to use in the scanning pool. WARNING: No limit, setting a high '
+                             'value may crash device')
+    parser.add_argument('--update-workers', '-uw', type=int, default=UPDATE_WORKERS,
+                        help='number of update workers to use for updating database, etc. WARNING: No limit, setting '
+                             'a high value may crash device')
+    parser.add_argument('--update-chunksize', '-uc', type=int, default=UPDATE_CHUNKSIZE,
+                        help='number of files to dedicate to each thread of a database update')
+    parser.add_argument('--update-database', '-u', action='store_true', default=False,
+                        help='update the database before beginning scan')
+    parser.add_argument('--scan-chunksize', '-sc', type=int, default=SCAN_CHUNKSIZE,
+                        help='number of files per process for scanning. None for automatic selection of chunksize')
+    parser.add_argument('--file-chunksize', '-fc', type=int, default=FILE_CHUNKSIZE,
+                        help='number of bytes to load per iteration for each file during scanning to prevent potential '
+                             'memory overload. None for loading files all at once')
+    parser.add_argument('--scan-type', '-st', choices=scan_types, default=scan_types[0], help='type of scan to perform')
+    parser.add_argument('--path', '-p', type=str, default=None,
+                        help=f'the path to scan (only applicable for --scan-type={scan_types[0]})')
+    parser.add_argument('--no-gpu', '-g', action='store_true', default=False,
+                        help='disable use GPU when applicable (such as for neural-network based databases)')
+    # parser.add_argument('--no-scan-side-calc', '-nc', action='store_true', default=False, help='disable thread-side calculations for individual files')
+    parser.add_argument('--load-while-scanning', '-ls', action='store_true', default=False,
+                        help='discover files in directory while scanning. Otherwise, find all files before scanning')
+    parser.add_argument('--log-level', '-l', choices=['info', 'debug', 'warning', 'error', 'critical'], default='info',
+                        help='log level to use')
+    parser.add_argument('--log-filename', '-lf', type=str, default=None,
+                        help="filename to write logs to. Default won't save any logs.")
+    parser.add_argument('--run-cli', '-cli', action='store_true', default=False,
+                        help='run the command line interface (CLI) after loading')
+    parser.add_argument('--no-display-infected', '-ni', action='store_true', default=False,
+                        help='disable printing of infected file results at the end of a scan when not using CLI')
+    parser.add_argument('--scan-archives', '-a', action='store_true', default=False,
+                        help='scan files contained in archives')
     return parser.parse_args()
 
 
-def main():
-    start = 0
+def run_cli():
+    from hashsum.database import HashDatabase, DummyDatabase
+    import time
+    import logging
 
+    NEWLINE = '\n'
     DB_TYPES = {
-        'hash': HashDatabase
+        'hash': HashDatabase,
+        'dummy': DummyDatabase
     }
     if TORCH_REQUIRED:
-        DB_TYPES.update({'neuralnet': NNDatabase})
+        from hashsum.database import NNDatabase
+        DB_TYPES.update({'nn': NNDatabase})
+
+    scanner = Scanner()
 
     SCAN_TYPES = {
-        'normal': normal_scan,
-        'memory': memory_scan,
-        'quick': quick_scan,
-        'system': system_scan,
-        'recent': recent_query
+        'normal': scanner.scan,
+        'recent': scanner.recent_scan,
+        'memory': scanner.memory_scan,
+        'quick': scanner.quick_scan,
+        'system': scanner.system_scan
     }
 
     args = _get_args(list(DB_TYPES.keys()), list(SCAN_TYPES.keys()))
+    logging.basicConfig(filename=args.log_filename)
+    logger = logging.getLogger(__name__)
+    logger.setLevel(getattr(logging, args.log_level.upper()))
+    logger.debug(f'Using args: {args}')
 
-    if args.scan_type == list(SCAN_TYPES.keys())[0]:
-        if not args.path and not args.run_cli:
-            raise ValueError('No path was supplied for scan type {}.'.format(args.scan_type))
-        scan = SCAN_TYPES[args.scan_type](args.path)
+    scanner.scan_chunksize = args.scan_chunksize
+    scanner.workers = args.scan_workers
+    scanner.log_errors = (args.log_level == 'error')
+
+    if args.database not in DB_TYPES.keys():
+        logger.error(f'Unsupported database type: {args.database}')
+        return
+    db = DB_TYPES[args.database](workers=args.db_workers)
+    logger.debug(f'Using database: {db}')
+
+    if db.updatable:
+        db.update_obj.workers = args.db_workers
+        db.update_obj.chunksize = args.update_chunksize
+        if args.update_database:
+            logger.info('Checking for updates...')
+            update = db.update_obj.check()
+            if update.available:
+                logger.info('New version available: %s, applying...', update.version)
+                update.apply(print_download=args.log_level == 'debug')
+                logger.info('Database updated to version %s', db.version)
+
+    logger.debug(f'Initializing scan type: {args.scan_type}')
+    if (
+            not args.run_cli
+            and (args.scan_type == list(SCAN_TYPES.keys())[0]
+                 or args.scan_type == list(SCAN_TYPES.keys())[1])
+    ):
+        if not args.path:
+            logger.error('No path was supplied for scan type %s', args.scan_type)
+            return
+
+        scan_func = partial(
+            SCAN_TYPES[args.scan_type],
+            paths=[args.path],
+            load_paths_while_scanning=args.load_while_scanning,
+            scan_archive_files=args.scan_archives,
+            file_load_chunksize=args.file_chunksize // scanner.workers
+        )
     else:
-        scan = SCAN_TYPES[args.scan_type]()
+        scan_func = partial(
+            SCAN_TYPES[args.scan_type],
+            load_paths_while_scanning=args.load_while_scanning,
+            scan_archive_files=args.scan_archives,
+            file_load_chunksize=args.file_chunksize // scanner.workers
+        )
 
-    try:
-        database = DB_TYPES[args.database.lower()]
-    except KeyError:
-        raise ValueError('Unsupported database type {}'.format(args.database))
-    if database == NNDatabase:
-        database = database(gpu=not args.no_gpu, thread_safe=False, load=False,
-                            scan_side_calc=not args.no_scan_side_calc)
-    elif database == HashDatabase:
-        database = database(load=False, update_workers=args.update_workers, update_chunksize=args.update_chunksize)
-    if args.update_database and database.updatable:
-        print('Updating database...')
-        database.update_obj.check().apply(load_into_memory=False)
+    logger.info('Loading database...')
+    db.load()
+    logger.debug('Connecting to scanner...')
+    scanner.connect(db)
 
-    print('Loading database...')
-    database.load(block=True)
-    scanner = Scanner(database, workers=args.scan_workers,
-                      file_chunksize=args.file_chunksize,
-                      load_chunksize=args.scan_load_chunksize,
-                      scan_archives=not args.no_scan_archives)
-
-    def _is_list(all_files) -> bool:
-        return isinstance(all_files, list)
-
-    def print_scan_status(**kwargs):
-        if _is_list(scanner.all_files):
-            print(f'\rScanned {len(scanner.files)}/{len(scanner.all_files)} files ({len(scanner.results)} items)'
-                  f' and found {len(scanner.infected)} threats ({round(utils.timesince(start), 1)} seconds)', **kwargs)
+    def display_stats(start_time, num_scanned_files, detected_files, num_total_files=0):
+        if not num_total_files:
+            num_total_files = '?'
         else:
-            print(f'\rScanned {len(scanner.results)} items and found {len(scanner.infected)} threats '
-                  f'({round(utils.timesince(start), 1)} seconds)', **kwargs)
+            num_total_files = f'{num_total_files} ({round(num_scanned_files / num_total_files * 100, 1)}%)'
+        display = f'{NEWLINE if args.display_results else ""}Scanned : {num_scanned_files}/{num_total_files}, ' \
+                  f'detected : {len(detected_files)}, elapsed : {round(utils.timesince(start_time), 1)}s'
 
-    def print_eta():
-        if not _is_list(scanner.all_files): return
-        print(f' Remaining: {round(utils.estimate_time(len(scanner.all_files), len(scanner.files), start), 1)}s\t\t',
-              end='', flush=True)
+        if not args.load_while_scanning:
+            display += f', ETA : {round(utils.estimate_time(total_files, scanned, start_time), 1)}s'
 
-    def print_infected():
+        print(display, end='\r')
+
+    def display_scan_results(start_time, num_scanned_files, detected_files):
         print()
-        [print(result) for result in scanner.infected]
+        logger.info(f'Scanned {num_scanned_files} files and detected {len(detected_files)} '
+                    f'malicious files in {round(utils.timesince(start_time), 1)}s.')
 
-    try:
-        while True:
-            if args.run_cli:
-                scan = normal_scan(input('\nDirectory/file to scan: '))
-            start = time.time()
-            print('Loading files to scan...')
+        if detected_files and (utils.check_yes('Show detected files?') if args.run_cli else not args.no_display_infected):
+            for result in detected_files:
+                if result.is_archive:
+                    display_result = result
+                    del display_result.details['archive_files']
+                    print(display_result)
+
+                    for archive_result in result.details.get('archive_files', []):
+                        if archive_result.malicious:
+                            print('\t', archive_result)
+                else:
+                    print(result)
+
+    while True:
+        if args.run_cli:
             try:
-                for res in iter(scanner.scan(scan)):
-                    if not res: continue
-                    if args.display_text:
-                        print(f"{'infected' if res.malicious else 'clean'}: {res.path}")
-                    else:
-                        print_scan_status(end='', flush=True)
-                        print_eta()
-            except (KeyboardInterrupt, EOFError):
-                scanner.stop_scan()
-                print('\nScan stopped.')
-
-            if args.display_text:
+                memory = False
+                path = input('Path to scan: ')
                 print()
-                print_scan_status(end='\t\t\n')
-            if len(scanner.infected) > 0:
-                if args.run_cli and utils.check_yes('\nShow potentially infected files? (y/n) '):
-                    print_infected()
-                elif not args.no_display_infected:
-                    print_infected()
+
+                if path.lower() in 'e q exit quit'.split():
+                    break
+                elif path.lower() in 'm mem memory'.split():
+                    memory = True
+            except KeyboardInterrupt:
+                print()
+                break
+
+        try:
+            detected = []
+            scanned = 0
+            total_files = 0
+            start = time.time()
+
+            if not args.load_while_scanning:
+                logger.info('Loading paths...')
+
+            for result in (
+                    scan_func([path] if not memory else None, memory)
+                    if args.run_cli else scan_func()
+            ):
+                scanned += 1
+                if result.malicious:
+                    detected.append(result)
+                if args.display_results:
+                    print(result)
+
+                if not args.load_while_scanning:
+                    if not total_files:
+                        total_files = len(list(scanner.file_iter))
+                        logger.debug('Total files: %s\n', total_files)
+
+                display_stats(start, scanned, detected, total_files)
+
+            display_scan_results(start, scanned, detected)
             if not args.run_cli:
                 break
-    except (KeyboardInterrupt, EOFError):
-        print('\nExiting...')
+        except KeyboardInterrupt:
+            scanner.stop_scan()
+            print()
+            if not args.run_cli:
+                break
 
 
 if __name__ == '__main__':
-    main()
-
-    '''
-    import sys
-
-    # database = NNDatabase(gpu=True, thread_safe=False, load=False, scan_side_calc=True)
-    database = HashDatabase()
-    got_args = len(sys.argv) > 1
-    if got_args:
-
-        scanner = Scanner(database)
-        display = True
-    else:
-        workers = int(utils.default_setting('Workers', SCAN_WORKERS))
-        chunksize = utils.default_setting('Chunksize', FILE_CHUNKSIZE)
-        if chunksize is not None:
-            chunksize = int(chunksize)
-        display = _DISPLAY
-        if utils.check_yes('Display scan text? (y/n) '):
-            display = True
-        scanner = Scanner(database, workers=workers, file_chunksize=chunksize)
-        if database.updatable:
-            if utils.check_yes('Update database? (y/n) '):
-                try:
-                    update = database.update_obj
-                    update.check()
-                    if update.available:
-                        update.apply(load_into_memory=False)
-                except KeyboardInterrupt:
-                    pass
-
-    print('Loading database...')
-    database.load(True)
-
-
-    def print_scan_end(**kwargs):
-        print(f'\rScanned {len(scanner.files)}/{len(scanner.all_files)} files and found {len(scanner.infected)} '
-              f'threats ({round(utils.timesince(start), 1)} seconds)', **kwargs)
-
-
-    def print_eta():
-        print(f' Remaining: {round(utils.estimate_time(len(scanner.all_files), len(scanner.files), start), 1)}s\t\t',
-              end='', flush=True)
-
-
-    try:
-        while True:
-            mem = False
-            displayed_num = False
-            if got_args:
-                path = sys.argv[1]
-            else:
-                path = input('\nDirectory/file to scan: ')
-            if path.lower() in 'm mem memory ram'.split():
-                mem = True
-            if os.path.exists(path) or mem:
-                start = time.time()
-                try:
-                    for res in scanner.scan(path) if not mem else scanner.memory_scan():
-                        if mem and not displayed_num:
-                            print(f'Scanning {len(scanner.all_files)} files in memory.')
-                            displayed_num = True
-                        if display:
-                            print(f"{'infected' if res.malicious else 'clean'}: {res.path}")
-                        else:
-                            print_scan_end(end='', flush=True)
-                            print_eta()
-                except (KeyboardInterrupt, EOFError):
-                    scanner.stop_scan()
-                    print('\nScan stopped.')
-                if display:
-                    print()
-                    print_scan_end(end='\t\t\n')
-                if len(scanner.infected) > 0:
-                    if not got_args and utils.check_yes('Show potentially infected files? (y/n) '):
-                        [print(result) for result in scanner.infected]
-            else:
-                print('The path entered does not exist.')
-            if got_args:
-                break
-    except (KeyboardInterrupt, EOFError):
-        print('\nExiting...')
-    '''
+    run_cli()

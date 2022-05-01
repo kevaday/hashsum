@@ -27,14 +27,12 @@ class ImageDataset(Dataset):
         return path_to_tensor(d, tfms=self.tfms)
 
 
-def path_to_tensor(path, tfms=None) -> Tensor:
-    if not tfms: tfms = transforms.Compose([transforms.ToTensor()])
-    path_is_str = False
-    if isinstance(path, str):
-        path_is_str = True
-        path = open(path, 'rb')
-    result = tfms(file_to_image(path, dimensions=DIMENSIONS))
-    if not path_is_str: path.close()
+def path_to_tensor(path: str = None, file_obj=None, tfms=TFMS) -> Tensor:
+    #assert path or file_obj, 'Must provide path or file_obj'
+    #if not tfms: tfms = transforms.Compose([transforms.ToTensor()])
+    if path: file_obj = open(path, 'rb')
+    result = tfms(file_to_image(file_obj, dimensions=DIMENSIONS))
+    file_obj.close()
     return result
 
 

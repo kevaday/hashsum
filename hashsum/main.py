@@ -1,4 +1,5 @@
 from copy import deepcopy
+from functools import partial
 
 from PyQt5 import QtGui, QtCore
 
@@ -105,7 +106,7 @@ class MainWindow(Ui_MainWindow):
         for menu_name, func_info in SCAN_TYPES.items():
             action = QtWidgets.QAction('&' + menu_name, self)
             action.setObjectName(menu_name)
-            action.triggered.connect(lambda: self.__scan_func_wrapper(*func_info))
+            action.triggered.connect(partial(self.__scan_func_wrapper, func=func_info[0], func_args=func_info[1:]))
             self.menu_Scan.addAction(action)
         self.menubar.addAction(self.menu_Scan.menuAction())
 
@@ -147,7 +148,7 @@ class MainWindow(Ui_MainWindow):
         self.btnBrowse.clicked.connect(self._browse_scan_path)
         if self.settings['load_on_start']: self.load_database()
 
-    def __scan_func_wrapper(self, func, *func_args):
+    def __scan_func_wrapper(self, func, func_args: list = None):
         """
         if not self.txtPath.text():
             show_dialog('This scan requires a file path to be entered, '
@@ -156,17 +157,18 @@ class MainWindow(Ui_MainWindow):
             return
         """
         args = []
-        for arg in func_args:
-            if SCAN_PATH_WILDCARD in arg:
-                value, accepted = QtWidgets.QInputDialog.getText(self, 'Path',
-                                                                 'Please enter a path to scan:',
-                                                                 text=self.txtPath.text())
-            else:
-                value, accepted = QtWidgets.QInputDialog.getDouble(self, 'Argument for Scan',
-                                                                   f'Please input a value for "{arg}":',
-                                                                   1, 0, 100000, 2)
-            if not accepted: return
-            args.append(value)
+        if func_args:
+            for arg in func_args:
+                if arg == SCAN_PATH_WILDCARD:
+                    value, accepted = QtWidgets.QInputDialog.getText(self, 'Path',
+                                                                     'Please enter a path to scan:',
+                                                                     text=self.txtPath.text())
+                else:
+                    value, accepted = QtWidgets.QInputDialog.getDouble(self, 'Argument for Scan',
+                                                                       f'Please input a value for "{arg}":',
+                                                                       1, 0, 100000, 2)
+                if not accepted: return
+                args.append(value)
 
         self.start_scan(func(*args))
 
@@ -200,14 +202,14 @@ class MainWindow(Ui_MainWindow):
         else:
             self.database.gpu = self.settings['use_gpu']
         self.scanner.workers = self.settings['scan_workers']
-        self.scanner.file_chunksize = self.settings['scan_chsz']
+        self.scanner.scan_chunksize = self.settings['scan_chsz']
         self.scanner.load_chunksize = self.settings['scan_load_chsz']
         self.scanner.scan_archives = self.settings['scan_archives']
         self.save_settings()
 
     def load_settings(self):
         with open(SETTINGS_FILENAME) as f:
-            self.settings.update(json.load(f))
+            self.settings.update_obj(json.load(f))
 
     def save_settings(self):
         with open(SETTINGS_FILENAME, 'w') as f:

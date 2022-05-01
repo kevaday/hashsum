@@ -1,9 +1,14 @@
-from typing import Iterator, Any, Iterable
+from typing import Iterator, Any, Iterable, BinaryIO, TextIO, Union, Callable, Tuple, Optional
+from itertools import islice
 
 import os
+import sys
 import time
 import random
+import psutil
 import hashlib
+import zipfile
+import tarfile
 import threading
 
 YES = 'y yes yea yeah yep yup'.split()
@@ -25,13 +30,60 @@ class StoppableThread(threading.Thread):
         return self._stop_event.is_set()
 
 
-def all_files(path: str, subdirs=True) -> Iterator[Any]:
-    if os.path.isfile(path): return path
-    if subdirs:
-        return (os.path.join(root, f) for root, _, files in os.walk(path)
-                for f in files if f is not None if root is not None)
+def get_mem_files(log_errors=False) -> Iterator[str]:
+    for proc in psutil.process_iter():
+        try:
+            yield proc.exe()
+            yield from map(lambda x: x.path, proc.open_files())
+        except psutil.Error as e:
+            if log_errors:
+                sys.stderr.write(str(e))
+
+
+def all_files(path: str, subdirs=True) -> Iterator[str]:
+    if os.path.isfile(path):
+        yield path
+
+    elif subdirs:
+        for root, _, files in os.walk(path):
+            for file in files:
+                if file is not None and root is not None:
+                    yield os.path.join(root, file)
+
     else:
-        return (os.path.join(path, file) for file in os.listdir(path) if os.path.isfile(os.path.join(path, file)))
+        for file in os.listdir(path):
+            file = os.path.join(path, file)
+            if file is not None and os.path.isfile(file):
+                yield file
+
+
+def iter_all_files(paths: Iterable[str], subdirs=True) -> Iterator[str]:
+    for path in paths:
+        yield from all_files(path, subdirs)
+
+
+def iter_random_files(paths: Iterable[str], count: int, subdirs=True) -> Iterator[Any]:
+    files = list(iter_all_files(paths, subdirs=subdirs))
+    if count >= len(files):
+        return iter(files)
+
+    for _ in range(count):
+        file = random.choice(files)
+        yield file
+        files.remove(file)
+
+
+def iter_recent_files(paths: Iterable[str], hours: Union[float, int], modified=True, subdirs=True, ignore_errors=True) -> Iterator[Any]:
+    now = time.time()
+    func = os.path.getmtime if modified else os.path.getatime
+
+    for file in iter_all_files(paths, subdirs=subdirs):
+        try:
+            if (now - func(file)) / 3600 <= hours:
+                yield file
+        except os.error as e:
+            if not ignore_errors:
+                raise e
 
 
 def all_dirs(directory: str) -> Iterator[Any]:
@@ -52,32 +104,6 @@ def dir_iter(directory: str) -> Iterator[Any]:
             yield os.path.join(root, d)
 
 
-def random_file(files: list):
-    return random.choice(files)
-
-
-def random_files(path: str, count: int, subdirs=True) -> Iterator[Any]:
-    files = list(all_files(path, subdirs=subdirs))
-    if count >= len(files):
-        return files
-
-    for _ in range(count):
-        file = random_file(files)
-        yield file
-        files.remove(file)
-
-
-def recent_modified_files(path: str, hours: float or int, subdirs=True, ignore_errors=True) -> Iterator[Any]:
-    now = time.time()
-    for file in all_files(path, subdirs=subdirs):
-        try:
-            if (now - os.path.getmtime(file)) / 3600 <= hours:
-                yield file
-        except os.error as e:
-            if not ignore_errors:
-                raise e
-
-
 def traverse(o: Iterable, tree_types=(list, tuple)):
     if isinstance(o, tree_types):
         for value in o:
@@ -87,26 +113,44 @@ def traverse(o: Iterable, tree_types=(list, tuple)):
         yield o
 
 
-def get_md5(path: str = None, file_obj=None, chunksize=None) -> bytes:
-    assert path is not None or file_obj is not None
+def hash_from_str(x: str) -> int:
+    return int(x, 16)
+
+
+def hash_from_bytes(x: bytes) -> int:
+    return hash_from_str(x.hex())
+
+
+def hash_from_int(x: int) -> bytes:
+    return bytes.fromhex(hex(x))
+
+
+def hash_to_hex(x: int) -> str:
+    return hex(x)[2:]
+
+
+def get_md5(path: str = None, file_obj: BinaryIO = None, chunksize: int = None) -> int:
+    #assert path is not None or file_obj is not None
     hash_md5 = hashlib.md5()
 
     if path:
         f = open(path, 'rb')
     else:
         f = file_obj
+
     if chunksize:
         for chunk in iter(lambda: f.read(chunksize), b''):
             hash_md5.update(chunk)
     else:
         hash_md5.update(f.read())
+
     if path:
         f.close()
 
-    return hash_md5.digest()
+    return hash_from_str(hash_md5.hexdigest())
 
 
-def read_in_chunks(file_obj, chunk_size):
+def read_in_chunks(file_obj: Union[TextIO, BinaryIO], chunk_size: int) -> Iterator[Union[bytes, str]]:
     """
     Read a file in chunks generator
     :param file_obj: file object to read from
@@ -121,21 +165,44 @@ def read_in_chunks(file_obj, chunk_size):
         yield data
 
 
+def iter_chunks(chunksize: int, iterable: Iterable) -> Iterator:
+    i = iter(iterable)
+    piece = list(islice(i, chunksize))
+    while piece:
+        yield piece
+        piece = list(islice(i, chunksize))
+
+
+def int_to_bytes(num: int) -> bytes:
+    """
+    Convert an unsigned integer to a bytes object
+    :param num: unsigned integer to convert
+    :return: bytes object
+    """
+    return num.to_bytes((num.bit_length() + 7) // 8, 'big')
+
+
+def bytes_to_int(bytes_obj: bytes) -> int:
+    """
+    Convert a bytes object to an unsigned integer
+    :param bytes_obj: bytes object to convert
+    :return: unsigned integer
+    """
+    return int.from_bytes(bytes_obj, 'big')
+
+
 def version_to_dbversion(version: int) -> str:
     """
     Convert an integer version to VirusShare database format
     :param version: integer version
     :return: str, VirusShare format version
     """
-    zeros = 5 - len(str(version))
-    zeros = '0' * zeros
-    zeros += str(version)
-
-    return zeros
+    v = str(version)
+    return '0' * (5 - len(v)) + v
 
 
 def check_yes(text: str) -> bool:
-    return input(text).lower() in YES
+    return input(f'{text} [y/N] ').lower() in YES
 
 
 def default_setting(text: str, default: Any) -> str:
@@ -159,16 +226,31 @@ def estimate_time(n_total: int, n_done: int, start_time: float) -> float:
     :return: estimated time remaining in seconds
     """
     try:
-        return (n_total - n_done) / (n_done / timesince(start_time))
+        return (n_total - n_done) * timesince(start_time) / n_done
     except ZeroDivisionError:
         return 0.
 
 
-def archive_to_fileobj(path: str, zipfile=None, tarfile=None):
-    if zipfile:
-        return zipfile.filename, zipfile.open(path, 'r')
-    elif tarfile:
-        return tarfile.name, tarfile.extractfile(path).fileobj
+def iter_archive_files(path: str) -> Iterator[Tuple[str, Optional[Union[zipfile.ZipFile, tarfile.TarFile]]]]:
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            for file in archive.namelist():
+                yield file, archive
+
+    elif tarfile.is_tarfile(path):
+        with tarfile.TarFile(path) as archive:
+            for file in archive.getmembers():
+                yield file, archive
+
+    else:
+        yield path, None
+
+
+def archive_to_fileobj(path: str, archive: Union[zipfile.ZipFile, tarfile.TarFile]) -> Tuple[str, Optional[BinaryIO]]:
+    if isinstance(archive, zipfile.ZipFile):
+        return archive.filename, archive.open(path, 'r')
+    elif isinstance(archive, tarfile.TarFile):
+        return archive.name, archive.extractfile(path)
     else:
         return path, None
 

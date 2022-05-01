@@ -1,6 +1,5 @@
 from PIL import Image
 import math
-from io import StringIO
 import os
 import sys
 
@@ -11,7 +10,7 @@ def choose_file_dimensions(infile, input_dimensions=None):
         # the dimensions were already fully specified
         return input_dimensions
     num_bytes = int(file_size(infile))
-    print("File size:", num_bytes)
+    # print("File size:", num_bytes)
     num_pixels = int(math.ceil(float(num_bytes) / 3.0))
     sqrt = math.sqrt(num_pixels)
     sqrt_max = int(math.ceil(sqrt))
@@ -102,7 +101,6 @@ def png_to_file(infile, outfile):
 
 
 def file_size(fname):
-    import os
     statinfo = os.stat(fname)
     return statinfo.st_size
 

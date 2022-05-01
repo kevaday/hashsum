@@ -56,7 +56,7 @@
 # from __future__ import print_function
 # from __future__ import division
 from torchvision import datasets, models, transforms
-from classifier.utils import save_model, load_model, device
+from classifier.utils import save_model, load_model, get_device
 
 import torch
 import torch.nn as nn
@@ -494,6 +494,7 @@ def main(data_dir, save_dir='./save', model_name='densenet', checkpoint=None, nu
     # and only include the weights and biases of the reshaped layers.
 
     # Send the model to GPU
+    device = get_device()
     model_ft = model_ft.to(device)
 
     # Gather the parameters to be optimized/updated in this run. If we are
