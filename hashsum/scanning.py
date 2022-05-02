@@ -419,10 +419,10 @@ def run_cli():
 
     def display_stats(start_time, num_scanned_files, detected_files, num_total_files=0):
         if not num_total_files:
-            num_total_files = '?'
+            num_total_files = ''
         else:
-            num_total_files = f'{num_total_files} ({round(num_scanned_files / num_total_files * 100, 1)}%)'
-        display = f'{NEWLINE if args.display_results else ""}Scanned : {num_scanned_files}/{num_total_files}, ' \
+            num_total_files = f'/{num_total_files} ({round(num_scanned_files / num_total_files * 100, 1)}%)'
+        display = f'{NEWLINE if args.display_results else ""}Scanned : {num_scanned_files}{num_total_files}, ' \
                   f'detected : {len(detected_files)}, elapsed : {round(utils.timesince(start_time), 1)}s'
 
         if not args.load_while_scanning:
