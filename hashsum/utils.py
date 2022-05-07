@@ -4,6 +4,7 @@ from itertools import islice
 import os
 import sys
 import time
+import glob
 import random
 import psutil
 import hashlib
@@ -84,6 +85,11 @@ def iter_recent_files(paths: Iterable[str], hours: Union[float, int], modified=T
         except os.error as e:
             if not ignore_errors:
                 raise e
+
+
+def iter_globs(globs: Iterable[str]) -> Iterator[str]:
+    for g in globs:
+        yield from glob.glob(g)
 
 
 def all_dirs(directory: str) -> Iterator[Any]:

@@ -48,7 +48,9 @@ class DatabaseResult(object):
             self.details = {}
 
     def __repr__(self):
-        return f"<DatabaseResult path={self.path}, malicious={self.malicious}, is_archive={self.is_archive}, in_archive={self.in_archive}, details={self.details}, error={self.error}>"
+        return f'<{self.__class__.__name__} path={self.path}, malicious={self.malicious}, ' \
+               f'is_archive={self.is_archive}, in_archive={self.in_archive}, ' \
+               f'details={self.details}, error={self.error}>'
 
 
 class BaseDatabase(ABC):
@@ -61,12 +63,12 @@ class BaseDatabase(ABC):
     STATE_STOPPING = 3
 
     def __init__(self, updateable=False, thread_safe=False, load=False, scan_side_calc=False, multi_lookup=False,
-                 has_version=False, on_load_fn=None, version_path=VERSION_FILENAME, workers=DATABASE_WORKERS):
+                 supports_gpu=False, on_load_fn=None, version_path=VERSION_FILENAME, workers=DATABASE_WORKERS):
         self._state = BaseDatabase.STATE_IDLE
         self.__updateable = updateable
         self.__scan_side_calc = scan_side_calc
         self.__multi = multi_lookup
-        self.__has_version = has_version
+        self.__supports_gpu = supports_gpu
         self.thread_safe = thread_safe
         self.on_load_fn = on_load_fn
         self.version_path = os.path.abspath(version_path)
@@ -92,6 +94,11 @@ class BaseDatabase(ABC):
         self.stop_lookup(True)
         self.unload()
 
+    def __repr__(self):
+        return f'<{self.__class__.__name__} updateable={self.__updateable}, scan_side_calc={self.__scan_side_calc}, ' \
+               f'multi_lookup={self.__multi}, thread_safe={self.thread_safe}, ' \
+               f'version={self.__version}, loaded={self.loaded}>'
+
     @property
     def updatable(self):
         return self.__updateable
@@ -105,8 +112,8 @@ class BaseDatabase(ABC):
         return self.__multi
 
     @property
-    def has_version(self):
-        return self.__has_version
+    def supports_gpu(self):
+        return self.__supports_gpu
 
     @property
     def state(self) -> int:
@@ -130,7 +137,7 @@ class BaseDatabase(ABC):
     @_set_load
     def load(self, *args, **kwargs):
         ...
-        if self.has_version:
+        if self.updatable:
             self._load_version()
         if self.on_load_fn:
             self.on_load_fn()
@@ -206,7 +213,7 @@ class BaseDatabase(ABC):
 
     @staticmethod
     def _default_calc(path: str, scan_archive_files: bool, calc_func: Callable[[Union[str, BinaryIO, ]], Any],
-                      *calc_args, **calc_kwargs) -> Tuple[Any, DatabaseResult, List[Tuple[Any, DatabaseResult]]]:
+                      *calc_args, **calc_kwargs) -> Tuple[Any, DatabaseResult]:
         result = None
         is_archive = False
         archive_files = []
@@ -217,7 +224,8 @@ class BaseDatabase(ABC):
                     if archive is None:
                         break
 
-                    is_archive = True
+                    if not is_archive:
+                        is_archive = True
                     _, fileobj = utils.archive_to_fileobj(file, archive)
                     fileobj.seek(0, os.SEEK_END)
                     size = fileobj.tell()
@@ -236,9 +244,9 @@ class BaseDatabase(ABC):
                 return (
                     result,
                     DatabaseResult(
-                        path, error='Empty file', is_archive=is_archive, details={'archive_files': archive_files}
-                    ),
-                    archive_files
+                        path, error='Empty file', is_archive=is_archive,
+                        details={'size': size, 'archive_files': archive_files}
+                    )
                 )
 
         except READ_ERRORS as e:
@@ -246,16 +254,14 @@ class BaseDatabase(ABC):
                 result,
                 DatabaseResult(
                     path, error=str(e), is_archive=is_archive, details={'archive_files': archive_files}
-                ),
-                archive_files
+                )
             )
 
         return (
             result,
             DatabaseResult(
                 path, is_archive=is_archive, details={'size': size, 'archive_files': archive_files}
-            ),
-            archive_files
+            )
         )
 
     @staticmethod
@@ -290,6 +296,9 @@ class HashDatabase(BaseDatabase, set):
         self.__load_thread = None
         set.__init__(self)
         BaseDatabase.__init__(self, updateable=True, thread_safe=False, scan_side_calc=True, load=load, *args, **kwargs)
+
+    def __repr__(self):
+        return BaseDatabase.__repr__(self).replace('>', f', path={self.path!r}>')
 
     @property
     def signatures(self) -> int:
@@ -337,14 +346,17 @@ class HashDatabase(BaseDatabase, set):
 
     @staticmethod
     def do_calc(path: str, scan_archive_files=False, file_load_chunksize: int = None) -> Tuple[str, DatabaseResult]:
-        md5, result, archive_files = BaseDatabase._default_calc(
+        md5, result = BaseDatabase._default_calc(
             path, scan_archive_files, utils.get_md5, chunksize=file_load_chunksize
         )
 
+        archive_files = []
         if scan_archive_files:
-            for archive_md5, archive_result in archive_files:
+            for archive_md5, archive_result in result.details.get('archive_files', []):
                 archive_result.details['md5'] = archive_md5
-                result.details['archive_files'].append(archive_result)
+                archive_files.append(archive_result)
+
+        result.details['archive_files'] = archive_files
         result.details['md5'] = md5
 
         return path, result
@@ -356,11 +368,8 @@ class HashDatabase(BaseDatabase, set):
         if result.is_archive:
             for archive_result in result.details.get('archive_files', []):
                 md5 = archive_result.details.get('md5')
-                if md5:
-                    if md5 in self:
-                        malicious = True
-                        archive_result.malicious = True
-                    archive_result.details['md5'] = utils.hash_to_hex(md5)
+                malicious = archive_result.malicious = md5 in self
+                archive_result.details['md5'] = utils.hash_to_hex(md5)
 
         md5 = result.details.get('md5')
         if md5:
@@ -381,7 +390,7 @@ class NNDatabase(BaseDatabase):
         self.load_thread = None
         self.data_loader = None
         self.gpu = gpu
-        super().__init__(updateable=False, *args, **kwargs)
+        super().__init__(updateable=False, supports_gpu=True, *args, **kwargs)
 
     @property
     def gpu(self):
@@ -408,17 +417,18 @@ class NNDatabase(BaseDatabase):
         self.data_loader = None
         super().unload()
 
-    def do_calc(self, path: str, scan_archive_files: bool = True, *args, **kwargs):
-        return path, BaseDatabase._default_calc(
+    @staticmethod
+    def do_calc(path: str, scan_archive_files: bool = False, *args, **kwargs):
+        return (path, *BaseDatabase._default_calc(
             path, scan_archive_files, path_to_tensor
-        )
+        ))
 
-    def lookup(self, path: str, _inp=None, _result=None, _archive_files=None,
-               *calc_args, **calc_kwargs) -> DatabaseResult:
+    def lookup(self, path: str, _inp=None, _result=None, *calc_args, **calc_kwargs) -> DatabaseResult:
         if not _result:
-            _, _inp, _result, _archive_files = self.do_calc(path, *calc_args, **calc_kwargs)
+            _, _inp, _result = self.do_calc(path, *calc_args, **calc_kwargs)
 
-        for archive_inp, archive_result in _archive_files:
+        archive_files = []
+        for archive_inp, archive_result in _result.details.get('archive_files', []):
             archive_inp = archive_inp.to(get_device())
             output = self.learner.model(archive_inp.unsqueeze(0))
             cls = output_to_class(self.learner, output)[0]
@@ -430,7 +440,8 @@ class NNDatabase(BaseDatabase):
             archive_result.details['confidence'] = confidence
             archive_result.details['malware_prob'] = prob
 
-            _result.details['archive_files'].append(archive_result)
+            archive_files.append(archive_result)
+        _result.details['archive_files'] = archive_files
 
         _inp = _inp.to(get_device())
         output = self.learner.model(_inp.unsqueeze(0))
@@ -528,9 +539,6 @@ class HashUpdate(object):
     def check(self) -> 'HashUpdate':
         self._set_state(HashUpdate.STATE_CHECKING)
         self.available = False
-        if self.database.version == self.database._NOT_LOADED:
-            return self
-
         next_version = utils.version_to_dbversion(int(self.database.version) + 1)
 
         try:

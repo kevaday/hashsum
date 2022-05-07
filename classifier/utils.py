@@ -72,8 +72,10 @@ def malware_prob(learner: Learner, outputs: Tensor) -> list:
 
 
 def set_device(gpu=True):
-    if gpu: defaults.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    else: defaults.device = torch.device('cpu')
+    if gpu:
+        defaults.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    else:
+        defaults.device = torch.device('cpu')
 
 
 def get_device():

@@ -82,6 +82,9 @@ class BaseScanner(object):
         if database:
             self.connect(database)
 
+    def __repr__(self):
+        return f'<{self.__class__.__name__} state={self.state}, db_type={self._db_type}>'
+
     def connect(self, database: BaseDatabase) -> None:
         self._db_type = type(database)
         self.__lookup_q = database.connect(self.__result_q)
@@ -139,6 +142,10 @@ class Scanner(BaseScanner):
         self.log_errors = log_errors
         self.calc_args = calc_args
         self.calc_kwargs = calc_kwargs
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__} state={self.state}, db_type={self._db_type}, workers={self.workers}, ' \
+               f'scan_chunksize={self.scan_chunksize}, log_errors={self.log_errors}>'
 
     @staticmethod
     def __submit_paths(calc_func: Callable[[str, Any], Any], calc_args: tuple, calc_kwargs: dict,
@@ -223,7 +230,7 @@ class Scanner(BaseScanner):
                     _process_chunk, chunk, self._db_type.do_calc, calc_args, calc_kwargs, child_conn
                 ) for chunk in chunks]
 
-                while self.state == self.STATE_SCANNING and not (all([f.done() for f in fs])) and not child_conn.poll():
+                while self.state == self.STATE_SCANNING and not (all(f.done() for f in fs) and not child_conn.poll()):
                     self._submit(parent_conn.recv())
                     result = self._get_result()
                     yield result
@@ -287,6 +294,9 @@ class Scanner(BaseScanner):
                          file_iterator=partial(utils.iter_recent_files, _DAY, modified=False, subdirs=True),
                          *args, **kwargs)
 
+    def glob_scan(self, globs: List[str] = None, *args, **kwargs) -> Iterator[DatabaseResult]:
+        return self.scan(globs, scan_memory=globs is None, file_iterator=utils.iter_globs, *args, **kwargs)
+
 
 def _get_args(db_types: List[str], scan_types: List[str]):
     from hashsum import DATABASE_WORKERS, UPDATE_CHUNKSIZE
@@ -341,6 +351,8 @@ def run_cli():
     import time
     import logging
 
+    scanner = Scanner()
+
     NEWLINE = '\n'
     DB_TYPES = {
         'hash': HashDatabase,
@@ -350,17 +362,31 @@ def run_cli():
         from hashsum.database import NNDatabase
         DB_TYPES.update({'nn': NNDatabase})
 
-    scanner = Scanner()
-
+    REQUIRES_PATH = 3
     SCAN_TYPES = {
         'normal': scanner.scan,
+        'glob': scanner.glob_scan,
         'recent': scanner.recent_scan,
         'memory': scanner.memory_scan,
         'quick': scanner.quick_scan,
         'system': scanner.system_scan
     }
-
+    DEFAULT_SCAN_TYPE = list(SCAN_TYPES.keys())[0]
     args = _get_args(list(DB_TYPES.keys()), list(SCAN_TYPES.keys()))
+    SCAN_KWARGS = {
+        'load_paths_while_scanning': args.load_while_scanning,
+        'scan_archive_files': args.scan_archives,
+        'file_load_chunksize': args.file_chunksize // scanner.workers
+    }
+
+    def scan_func():
+        if args.scan_type not in SCAN_TYPES:
+            raise ValueError(f'Invalid scan type: {args.scan_type}')
+        elif args.scan_type in list(SCAN_TYPES.keys())[:REQUIRES_PATH]:
+            return SCAN_TYPES[args.scan_type](paths=[args.path], **SCAN_KWARGS)
+        else:
+            return SCAN_TYPES[args.scan_type](**SCAN_KWARGS)
+
     logging.basicConfig(filename=args.log_filename)
     logger = logging.getLogger(__name__)
     logger.setLevel(getattr(logging, args.log_level.upper()))
@@ -374,6 +400,8 @@ def run_cli():
         logger.error(f'Unsupported database type: {args.database}')
         return
     db = DB_TYPES[args.database](workers=args.db_workers)
+    if db.supports_gpu:
+        db.gpu = not args.no_gpu
     logger.debug(f'Using database: {db}')
 
     if db.updatable:
@@ -387,30 +415,16 @@ def run_cli():
                 update.apply(print_download=args.log_level == 'debug')
                 logger.info('Database updated to version %s', db.version)
 
-    logger.debug(f'Initializing scan type: {args.scan_type}')
-    if (
-            not args.run_cli
-            and (args.scan_type == list(SCAN_TYPES.keys())[0]
-                 or args.scan_type == list(SCAN_TYPES.keys())[1])
-    ):
-        if not args.path:
-            logger.error('No path was supplied for scan type %s', args.scan_type)
-            return
-
-        scan_func = partial(
-            SCAN_TYPES[args.scan_type],
-            paths=[args.path],
-            load_paths_while_scanning=args.load_while_scanning,
-            scan_archive_files=args.scan_archives,
-            file_load_chunksize=args.file_chunksize // scanner.workers
-        )
+    if args.run_cli:
+        args.path = None
+        args.scan_type = DEFAULT_SCAN_TYPE
     else:
-        scan_func = partial(
-            SCAN_TYPES[args.scan_type],
-            load_paths_while_scanning=args.load_while_scanning,
-            scan_archive_files=args.scan_archives,
-            file_load_chunksize=args.file_chunksize // scanner.workers
-        )
+        if args.scan_type in list(SCAN_TYPES.keys())[:REQUIRES_PATH]:
+            if not args.path:
+                logger.error('No path was supplied for scan type %s', args.scan_type)
+                return
+        else:
+            args.path = None
 
     logger.info('Loading database...')
     db.load()
@@ -451,14 +465,17 @@ def run_cli():
     while True:
         if args.run_cli:
             try:
-                memory = False
-                path = input('Path to scan: ')
+                args.path = input('Path to scan: ')
                 print()
 
-                if path.lower() in 'e q exit quit'.split():
+                if args.path.lower() in 'e q exit quit'.split():
                     break
-                elif path.lower() in 'm mem memory'.split():
-                    memory = True
+                elif args.path.lower() in list(SCAN_TYPES.keys())[REQUIRES_PATH:]:
+                    args.scan_type = args.path.lower()
+                    args.path = None
+                else:
+                    args.scan_type = DEFAULT_SCAN_TYPE
+
             except KeyboardInterrupt:
                 print()
                 break
@@ -472,10 +489,7 @@ def run_cli():
             if not args.load_while_scanning:
                 logger.info('Loading paths...')
 
-            for result in (
-                    scan_func([path] if not memory else None, memory)
-                    if args.run_cli else scan_func()
-            ):
+            for result in scan_func():
                 scanned += 1
                 if result.malicious:
                     detected.append(result)
