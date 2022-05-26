@@ -3,7 +3,7 @@ from hashsum import SCAN_WORKERS, TORCH_REQUIRED, FILE_CHUNKSIZE, SCAN_CHUNKSIZE
 from hashsum import utils
 from hashsum.database import BaseDatabase, DatabaseResult
 from hashsum.errors import READ_ERRORS, ScanError
-from typing import List, Iterator, Iterable, Callable, Any, Union, Tuple
+from typing import List, Iterator, Iterable, Callable, Any, Union, Tuple, Dict
 from threading import Thread, Lock
 from queue import Queue
 from concurrent.futures import ProcessPoolExecutor, Future
@@ -48,6 +48,11 @@ def _process_chunk(chunk: Iterable[str], calc_func: Callable[[str, Any], Any], c
         pipe_conn.send(calc_func(file, *calc_args, **calc_kwargs))
 
 
+def _iter_scan_async(func, *args, **kwargs):
+    for _ in func(*args, **kwargs):
+        pass
+
+
 class _FileIterator(object):
     def __init__(self, paths: List[str], file_iterator: Callable[[Iterable[str]], Iterator[str]],
                  scan_memory: bool, log_errors: bool):
@@ -79,13 +84,16 @@ class BaseScanner(object):
         self._db_type = None
         self._file_iter = []
         self._results = []
-        if database:
+        if database is not None:
             self.connect(database)
 
     def __repr__(self):
         return f'<{self.__class__.__name__} state={self.state}, db_type={self._db_type}>'
 
     def connect(self, database: BaseDatabase) -> None:
+        if database.is_lookup_running:
+            database.stop_lookup(block=True)
+
         self._db_type = type(database)
         self.__lookup_q = database.connect(self.__result_q)
         database.start_lookup()
@@ -132,13 +140,17 @@ class BaseScanner(object):
         self._reset_state()
         self._reset_vars()
 
+    def get_scan_types(self) -> Dict[str, Tuple[Callable, Tuple[str, Any], ]]:
+        pass
+
 
 class Scanner(BaseScanner):
     def __init__(self, database: BaseDatabase = None, workers: int = SCAN_WORKERS, scan_chunksize: int = None,
-                 log_errors=False, *calc_args, **calc_kwargs):
+                 scan_archives=False, log_errors=False, *calc_args, **calc_kwargs):
         super().__init__(database)
         self.workers = workers
         self.scan_chunksize = scan_chunksize
+        self.scan_archives = scan_archives
         self.log_errors = log_errors
         self.calc_args = calc_args
         self.calc_kwargs = calc_kwargs
@@ -165,10 +177,11 @@ class Scanner(BaseScanner):
              file_iterator: Callable[[Iterable[str]], Iterator[str]] = utils.iter_all_files,
              load_paths_while_scanning=False, *calc_args, **calc_kwargs) -> Iterator[DatabaseResult]:
         if not paths and not scan_memory:
-            raise ValueError('No paths or memory to scan.')
+            raise ValueError('No paths or memory provided to scan.')
 
         super().scan()
         self._set_state(self.STATE_LOAD_PATHS)
+        calc_kwargs['scan_archive_files'] = self.scan_archives
 
         files = _FileIterator(paths, file_iterator, scan_memory, self.log_errors)
         if not load_paths_while_scanning:
@@ -245,10 +258,13 @@ class Scanner(BaseScanner):
                 parent_conn.close()
                 child_conn.close()
 
-        self._set_state(self.STATE_IDLE)
+        self._reset_state()
 
-    def scan_async(self, *args, scan_func: Callable = None, **kwargs):
+    def scan_async(self, *args, scan_func: Callable = None, is_iterator=True, **kwargs):
         if not scan_func: scan_func = self.scan
+        if is_iterator: scan_func = partial(_iter_scan_async, scan_func)
+
+        self._set_state(self.STATE_SCANNING)
         self._scan_thread = Thread(target=scan_func, args=args, kwargs=kwargs, daemon=True)
         self._scan_thread.start()
 
@@ -262,8 +278,11 @@ class Scanner(BaseScanner):
         self._scan_thread = None
 
     # -------- Scan types --------
+    def normal_scan(self, *args, scan_subdirs: bool = True, **kwargs) -> Iterator[DatabaseResult]:
+        return self.scan(*args, file_iterator=partial(utils.iter_all_files, subdirs=scan_subdirs), **kwargs)
+
     def memory_scan(self, *args, **kwargs) -> Iterator[DatabaseResult]:
-        return self.scan(None, True, *args, **kwargs)
+        return self.scan(paths=None, scan_memory=True, *args, **kwargs)
 
     def quick_scan(self, *args, **kwargs) -> Iterator[DatabaseResult]:
         if IS_WINDOWS:
@@ -289,13 +308,24 @@ class Scanner(BaseScanner):
                          file_iterator=partial(utils.iter_recent_files, _FIVE_DAYS * 2, modified=False, subdirs=True),
                          *args, **kwargs)
 
-    def recent_scan(self, paths: List[str] = None, *args, **kwargs) -> Iterator[DatabaseResult]:
+    def recent_scan(self, paths: List[str] = None, hours: Union[float, int] = _DAY, *args, **kwargs) \
+            -> Iterator[DatabaseResult]:
         return self.scan(paths, scan_memory=paths is None,
-                         file_iterator=partial(utils.iter_recent_files, _DAY, modified=False, subdirs=True),
+                         file_iterator=partial(utils.iter_recent_files, hours, modified=False, subdirs=True),
                          *args, **kwargs)
 
     def glob_scan(self, globs: List[str] = None, *args, **kwargs) -> Iterator[DatabaseResult]:
         return self.scan(globs, scan_memory=globs is None, file_iterator=utils.iter_globs, *args, **kwargs)
+
+    def get_scan_types(self) -> dict:
+        return {
+            'memory': (self.memory_scan,),
+            'quick': (self.quick_scan,),
+            'system': (self.system_scan,),
+            'recent': (lambda path, hours, *args, **kwargs: self.recent_scan([path], hours, *args, **kwargs),
+                       ('path', str), ('hours', float)),
+            'glob': (lambda glob, *args, **kwargs: self.glob_scan([glob], *args, **kwargs), ('pattern', str))
+        }
 
 
 def _get_args(db_types: List[str], scan_types: List[str]):
@@ -375,7 +405,6 @@ def run_cli():
     args = _get_args(list(DB_TYPES.keys()), list(SCAN_TYPES.keys()))
     SCAN_KWARGS = {
         'load_paths_while_scanning': args.load_while_scanning,
-        'scan_archive_files': args.scan_archives,
         'file_load_chunksize': args.file_chunksize // scanner.workers
     }
 
@@ -394,6 +423,7 @@ def run_cli():
 
     scanner.scan_chunksize = args.scan_chunksize
     scanner.workers = args.scan_workers
+    scanner.scan_archives = args.scan_archives
     scanner.log_errors = (args.log_level == 'error')
 
     if args.database not in DB_TYPES.keys():
@@ -405,14 +435,13 @@ def run_cli():
     logger.debug(f'Using database: {db}')
 
     if db.updatable:
-        db.update_obj.workers = args.db_workers
-        db.update_obj.chunksize = args.update_chunksize
+        db._update_obj.workers = args.db_workers
+        db._update_obj.chunksize = args.update_chunksize
         if args.update_database:
             logger.info('Checking for updates...')
-            update = db.update_obj.check()
-            if update.available:
-                logger.info('New version available: %s, applying...', update.version)
-                update.apply(print_download=args.log_level == 'debug')
+            if db.check_update():
+                logger.info('New version available: %s, applying...', db._update_obj.version)
+                db.update(block=True, print_download=args.log_level == 'debug')
                 logger.info('Database updated to version %s', db.version)
 
     if args.run_cli:
@@ -432,12 +461,15 @@ def run_cli():
     scanner.connect(db)
 
     def display_stats(start_time, num_scanned_files, detected_files, num_total_files=0):
+        elapsed = round(utils.timesince(start_time), 1)
         if not num_total_files:
             num_total_files = ''
         else:
             num_total_files = f'/{num_total_files} ({round(num_scanned_files / num_total_files * 100, 1)}%)'
+        num_total_files += f' at {round(num_scanned_files / elapsed, 1)} files/s'
+
         display = f'{NEWLINE if args.display_results else ""}Scanned : {num_scanned_files}{num_total_files}, ' \
-                  f'detected : {len(detected_files)}, elapsed : {round(utils.timesince(start_time), 1)}s'
+                  f'detected : {len(detected_files)}, elapsed : {elapsed}s'
 
         if not args.load_while_scanning:
             display += f', ETA : {round(utils.estimate_time(total_files, scanned, start_time), 1)}s'

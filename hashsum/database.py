@@ -62,13 +62,14 @@ class BaseDatabase(ABC):
     STATE_RUNNING = 2
     STATE_STOPPING = 3
 
-    def __init__(self, updateable=False, thread_safe=False, load=False, scan_side_calc=False, multi_lookup=False,
-                 supports_gpu=False, on_load_fn=None, version_path=VERSION_FILENAME, workers=DATABASE_WORKERS):
+    def __init__(self, updatable=False, thread_safe=False, load=False, scan_side_calc=False, multi_lookup=False,
+                 supports_gpu=False, has_signatures=False, on_load_fn=None, version_path=VERSION_FILENAME, workers=DATABASE_WORKERS):
         self._state = BaseDatabase.STATE_IDLE
-        self.__updateable = updateable
+        self.__updatable = updatable
         self.__scan_side_calc = scan_side_calc
         self.__multi = multi_lookup
         self.__supports_gpu = supports_gpu
+        self.__has_signatures = has_signatures
         self.thread_safe = thread_safe
         self.on_load_fn = on_load_fn
         self.version_path = os.path.abspath(version_path)
@@ -95,13 +96,13 @@ class BaseDatabase(ABC):
         self.unload()
 
     def __repr__(self):
-        return f'<{self.__class__.__name__} updateable={self.__updateable}, scan_side_calc={self.__scan_side_calc}, ' \
+        return f'<{self.__class__.__name__} updateable={self.__updatable}, scan_side_calc={self.__scan_side_calc}, ' \
                f'multi_lookup={self.__multi}, thread_safe={self.thread_safe}, ' \
                f'version={self.__version}, loaded={self.loaded}>'
 
     @property
     def updatable(self):
-        return self.__updateable
+        return self.__updatable
 
     @property
     def scan_side_calc(self):
@@ -116,6 +117,10 @@ class BaseDatabase(ABC):
         return self.__supports_gpu
 
     @property
+    def has_signatures(self):
+        return self.__has_signatures
+
+    @property
     def state(self) -> int:
         return self._state
 
@@ -128,6 +133,10 @@ class BaseDatabase(ABC):
         self._write_version(value)
         self.__version = value
 
+    @property
+    def signatures(self) -> int:
+        raise NotImplementedError('Database is not signature-based')
+
     def _set_state(self, state: int) -> None:
         self._state = state
 
@@ -139,13 +148,28 @@ class BaseDatabase(ABC):
         ...
         if self.updatable:
             self._load_version()
+        self.loaded = True
         if self.on_load_fn:
             self.on_load_fn()
-        self.loaded = True
-    
+
+    @_set_load
     def unload(self):
         ...
         self.loaded = False
+
+    # ---- only for updateable databases ----
+    def check_update(self) -> bool:
+        raise NotImplementedError('Database is not updatable')
+
+    def update(self, block=True):
+        raise NotImplementedError('Database is not updatable')
+
+    def stop_update(self, block=True):
+        raise NotImplementedError('Database is not updatable')
+
+    @property
+    def is_update_running(self):
+        raise NotImplementedError('Database is not updatable')
 
     @_set_load
     def _load_version(self) -> None:
@@ -165,6 +189,7 @@ class BaseDatabase(ABC):
         version_dict[self.__class__.__name__] = version
         with open(self.version_path, 'wb') as f:
             pickle.dump(version_dict, f)
+    # ----------------------------------------
 
     @property
     def is_connected(self):
@@ -281,7 +306,7 @@ class DummyDatabase(BaseDatabase):
 
     @staticmethod
     def do_calc(path: str, *args, **kwargs) -> Any:
-        return path
+        return path, DatabaseResult(path)
 
     def lookup(self, path: str, *args, **kwargs) -> DatabaseResult:
         return DatabaseResult(path)
@@ -292,10 +317,11 @@ class HashDatabase(BaseDatabase, set):
                  update_workers=UPDATE_WORKERS, update_chunksize=UPDATE_CHUNKSIZE, *args, **kwargs):
         self.path = os.path.abspath(path)
         self.update_url = update_url
-        self.update_obj = HashUpdate(self, workers=update_workers, download_chunksize=update_chunksize)
+        self._update_obj = HashUpdate(self, workers=update_workers, download_chunksize=update_chunksize)
         self.__load_thread = None
         set.__init__(self)
-        BaseDatabase.__init__(self, updateable=True, thread_safe=False, scan_side_calc=True, load=load, *args, **kwargs)
+        BaseDatabase.__init__(self, updatable=True, thread_safe=False, scan_side_calc=True, has_signatures=True,
+                              load=load, *args, **kwargs)
 
     def __repr__(self):
         return BaseDatabase.__repr__(self).replace('>', f', path={self.path!r}>')
@@ -344,6 +370,41 @@ class HashDatabase(BaseDatabase, set):
         self.clear()
         super().unload()
 
+    def check_update(self) -> bool:
+        if self.version == self._NOT_LOADED:
+            self._load_version()
+        return self._update_obj.check().available
+
+    def update(self, block=True, *args, **kwargs):
+        if self.check_update():
+            if block:
+                self._update_obj.apply(*args, **kwargs)
+            else:
+                self._update_obj.apply_async(*args, **kwargs)
+
+    def stop_update(self, block=True):
+        if self.is_update_running:
+            self._update_obj.stop(block)
+
+    @property
+    def is_update_running(self):
+        return self._update_obj.state == self._update_obj.STATE_APPLYING
+
+    def write_database(self, path: str = None, overwrite=False) -> None:
+        """Write the current state of the database to disk."""
+        if not self.loaded:
+            raise ValueError('The database is not loaded.')
+
+        if not path:
+            path = self.path
+
+        if not overwrite and os.path.isfile(self.path):
+            raise ValueError('The database file already exists. Use overwrite=True to overwrite it.')
+
+        with open(path, 'wb') as f:
+            for hash_ in self:
+                f.write(utils.hash_from_int(hash_))
+
     @staticmethod
     def do_calc(path: str, scan_archive_files=False, file_load_chunksize: int = None) -> Tuple[str, DatabaseResult]:
         md5, result = BaseDatabase._default_calc(
@@ -390,7 +451,7 @@ class NNDatabase(BaseDatabase):
         self.load_thread = None
         self.data_loader = None
         self.gpu = gpu
-        super().__init__(updateable=False, supports_gpu=True, *args, **kwargs)
+        super().__init__(updatable=False, supports_gpu=True, *args, **kwargs)
 
     @property
     def gpu(self):
@@ -427,18 +488,22 @@ class NNDatabase(BaseDatabase):
         if not _result:
             _, _inp, _result = self.do_calc(path, *calc_args, **calc_kwargs)
 
+        if _inp is None:
+            return _result
+
         archive_files = []
         for archive_inp, archive_result in _result.details.get('archive_files', []):
-            archive_inp = archive_inp.to(get_device())
-            output = self.learner.model(archive_inp.unsqueeze(0))
-            cls = output_to_class(self.learner, output)[0]
-            confidence = get_max(output)[0]
-            prob = malware_prob(self.learner, output)[0]
+            if archive_inp is not None:
+                archive_inp = archive_inp.to(get_device())
+                output = self.learner.model(archive_inp.unsqueeze(0))
+                cls = output_to_class(self.learner, output)[0]
+                confidence = get_max(output)[0]
+                prob = malware_prob(self.learner, output)[0]
 
-            archive_result.malicious = (cls != 'Legitimate')
-            archive_result.details['class'] = cls
-            archive_result.details['confidence'] = confidence
-            archive_result.details['malware_prob'] = prob
+                archive_result.malicious = (cls != 'Legitimate')
+                archive_result.details['class'] = cls
+                archive_result.details['confidence'] = confidence
+                archive_result.details['malware_prob'] = prob
 
             archive_files.append(archive_result)
         _result.details['archive_files'] = archive_files
@@ -617,5 +682,8 @@ class HashUpdate(object):
             self.available = False
         self._set_state(HashUpdate.STATE_IDLE)
 
-    def stop(self):
+    def stop(self, block=True):
         self._set_state(HashUpdate.STATE_STOPPING)
+        if block and self._thread:
+            self._thread.join()
+            self._thread = None

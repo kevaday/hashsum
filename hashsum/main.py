@@ -1,14 +1,14 @@
-from copy import deepcopy
-from functools import partial
-
-from PyQt5 import QtGui, QtCore
-
-from hashsum._gui import *
 from hashsum import UPDATE_INTERVAL, SETTINGS_FILENAME, DEFAULT_SETTINGS, DB_TYPE_HASH, DB_TYPE_AI, DB_TYPE_DUMMY, \
     SCAN_PATH_WILDCARD
 from hashsum import utils
-from hashsum.database import HashDatabase, NNDatabase, BaseDatabase, HashUpdate, LoadError
-from hashsum.scanning import Scanner, SCAN_TYPES, ScanQuery
+from hashsum._gui import *
+from hashsum.database import HashDatabase, NNDatabase, DummyDatabase, HashUpdate, LoadError
+from hashsum.scanning import Scanner
+
+from PyQt5 import QtGui, QtCore
+from copy import deepcopy
+from functools import partial
+from typing import Callable
 
 import json
 import time
@@ -42,6 +42,8 @@ class DataSettingsWindow(Ui_FormDatabaseSettings, Settings):
         self.settings = settings
         self.btnBack.clicked.connect(self.close)
         self.btnReset.clicked.connect(self.reset_defaults)
+        self.checkUseGPU.clicked.connect(self.update_settings)
+        self.comboDatabase.currentTextChanged.connect(self.update_settings)
 
     def update_gui(self):
         self.gui_update.emit()
@@ -63,7 +65,7 @@ class DataSettingsWindow(Ui_FormDatabaseSettings, Settings):
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         self.update_settings()
-        event.accept()
+        super().closeEvent(event)
 
 
 class SettingsWindow(Ui_FormMainSettings, Settings):
@@ -96,19 +98,12 @@ class SettingsWindow(Ui_FormMainSettings, Settings):
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         self.update_settings()
-        event.accept()
+        super().closeEvent(event)
 
 
 class MainWindow(Ui_MainWindow):
     def __init__(self):
         super().__init__()
-
-        for menu_name, func_info in SCAN_TYPES.items():
-            action = QtWidgets.QAction('&' + menu_name, self)
-            action.setObjectName(menu_name)
-            action.triggered.connect(partial(self.__scan_func_wrapper, func=func_info[0], func_args=func_info[1:]))
-            self.menu_Scan.addAction(action)
-        self.menubar.addAction(self.menu_Scan.menuAction())
 
         self.settings = DEFAULT_SETTINGS
         self.generate_settings()
@@ -120,9 +115,15 @@ class MainWindow(Ui_MainWindow):
         self.win_settings = None
         self.win_data_settings = None
 
+        for menu_name, func_info in self.scanner.get_scan_types().items():
+            action = QtWidgets.QAction('&' + menu_name, self)
+            action.setObjectName(menu_name)
+            action.triggered.connect(partial(self.__scan_func_wrapper, func=func_info[0], func_args=func_info[1:]))
+            self.menu_Scan.addAction(action)
+        self.menubar.addAction(self.menu_Scan.menuAction())
+
         self.win_about = Ui_FormAbout()
         self.dialog = None
-        self.__update = None
 
         self.__load_timer = QtCore.QTimer(self)
         self.__load_timer.setInterval(UPDATE_INTERVAL)
@@ -138,43 +139,45 @@ class MainWindow(Ui_MainWindow):
         self.action_About.triggered.connect(self.win_about.show)
         self.action_Exit.triggered.connect(self.close)
         self.actionLoad.triggered.connect(self.load_database)
-        if self.__is_sig_database: self.actionUnload.triggered.connect(self.database.unload)
+        self.actionUnload.triggered.connect(self.database.unload)
         self.action_Update.triggered.connect(self.update_database)
         self.action_DataSettings.triggered.connect(self.open_data_settings)
 
         self.scan_running = False
         self.start_time = None
+        self.__status_text = ''
+        self.__total_files = 0
         self.btnStartStop.clicked.connect(lambda: self.start_scan())
         self.btnBrowse.clicked.connect(self._browse_scan_path)
         if self.settings['load_on_start']: self.load_database()
 
     def __scan_func_wrapper(self, func, func_args: list = None):
-        """
-        if not self.txtPath.text():
-            show_dialog('This scan requires a file path to be entered, '
-                        'please enter the path in the scan input box.', self, title='File Path Required',
-                        error=True, modal=True)
-            return
-        """
         args = []
         if func_args:
-            for arg in func_args:
-                if arg == SCAN_PATH_WILDCARD:
-                    value, accepted = QtWidgets.QInputDialog.getText(self, 'Path',
-                                                                     'Please enter a path to scan:',
+            for arg, arg_type in func_args:
+                if arg_type == str:
+                    value, accepted = QtWidgets.QInputDialog.getText(self, 'Argument: ' + arg,
+                                                                     f'Please enter text for the argument "{arg}":',
                                                                      text=self.txtPath.text())
-                else:
-                    value, accepted = QtWidgets.QInputDialog.getDouble(self, 'Argument for Scan',
-                                                                       f'Please input a value for "{arg}":',
+                elif arg_type == int:
+                    value, accepted = QtWidgets.QInputDialog.getInt(self, 'Argument: ' + arg,
+                                                                    f'Please enter an integer for the argument "{arg}":',
+                                                                    value=self.txtPath.text())
+                elif arg_type == float:
+                    value, accepted = QtWidgets.QInputDialog.getDouble(self, 'Argument: ' + arg,
+                                                                       f'Please input a number for "{arg}":',
                                                                        1, 0, 100000, 2)
+                elif arg_type == bool:
+                    value, accepted = QtWidgets.QInputDialog.getItem(self, 'Argument: ' + arg,
+                                                                     f'Please select an option for "{arg}":',
+                                                                     ['True', 'False'], 0, False)
+                else:
+                    raise ValueError(f'Invalid argument type "{arg_type}"')
+
                 if not accepted: return
                 args.append(value)
 
-        self.start_scan(func(*args))
-
-    @property
-    def __is_sig_database(self):
-        return isinstance(self.database, HashDatabase)
+        self.start_scan(func, tuple(args))
 
     def generate_settings(self):
         if os.path.exists(SETTINGS_FILENAME): return
@@ -190,32 +193,39 @@ class MainWindow(Ui_MainWindow):
                 self.database = NNDatabase(gpu=self.settings['use_gpu'], thread_safe=False, load=False,
                                            scan_side_calc=True, on_load_fn=self.__on_load)
             elif db_type == DB_TYPE_DUMMY:
-                self.database = BaseDatabase(on_load_fn=self.__on_load)
+                self.database = DummyDatabase(on_load_fn=self.__on_load)
             else:
                 raise ValueError(f'Invalid database type encountered: {db_type}')
             self._old_db_type = deepcopy(db_type)
+
         self.scanner = Scanner(self.database)
         self.database.chunksize = self.settings['data_load_chsz']
-        if self.__is_sig_database:
-            self.database.update_obj.workers = self.settings['data_workers']
-            self.database.update_obj.chunksize = self.settings['update_chsz']
-        else:
+        print(f'[DEBUG] Using database type: {type(self.database)}')
+
+        if isinstance(self.database, HashDatabase):
+            self.database._update_obj.workers = self.settings['data_workers']
+            self.database._update_obj.chunksize = self.settings['update_chsz']
+        elif isinstance(self.database, NNDatabase):
             self.database.gpu = self.settings['use_gpu']
+
         self.scanner.workers = self.settings['scan_workers']
         self.scanner.scan_chunksize = self.settings['scan_chsz']
         self.scanner.load_chunksize = self.settings['scan_load_chsz']
         self.scanner.scan_archives = self.settings['scan_archives']
         self.save_settings()
 
+        print(f'[DEBUG] Setting loaded:\n{self.settings}')
+
     def load_settings(self):
         with open(SETTINGS_FILENAME) as f:
-            self.settings.update_obj(json.load(f))
+            self.settings.update(json.load(f))
 
     def save_settings(self):
         with open(SETTINGS_FILENAME, 'w') as f:
             json.dump(self.settings, f)
 
     def load_database(self):
+        self.update_settings()
         self.dialog = CancelDialog()
         self.dialog.lblMsg.setText('Loading database...')
         self.dialog.setWindowTitle('Loading')
@@ -225,7 +235,7 @@ class MainWindow(Ui_MainWindow):
         self.dialog.show()
 
         try:
-            if self.__is_sig_database: self.database.clear()
+            self.database.unload()
             self.database.load(block=False)
         except LoadError as e:
             self.dialog.close()
@@ -255,25 +265,25 @@ class MainWindow(Ui_MainWindow):
                 show_dialog(f'Failed to load database. Error: {e}', self, title='Error', error=True)
 
     def __check_update_done(self):
-        if self.__update.state == HashUpdate.STATE_IDLE:
+        if not self.database.is_update_running:
             self.dialog.close()
             self.__update_timer.stop()
             show_dialog(f'Database updated. New version: {self.database.version}', self, title='Database Updated')
 
     def check_update(self) -> bool:
-        if self.__is_sig_database:
+        if self.database.updatable:
             self._set_loading()
-            value = self.database.update_obj.check().available
+            available = self.database.check_update()
             self._set_loading(False)
-            return value
+            return available
         else:
             return False
 
     def update_database(self):
-        if not self.__is_sig_database:
-            show_dialog('The loaded database is not updatable.', self, "Can't Update", error=True)
+        if not self.database.updatable:
+            show_dialog('The selected database is not updatable.', self, "Can't Update", error=True)
             return
-        self.__update = self.database.update_obj
+
         if not self.check_update():
             show_dialog(f'Database up to date. Version {self.database.version}', self, title='Up to Date')
             return
@@ -282,13 +292,13 @@ class MainWindow(Ui_MainWindow):
         self.dialog.lblMsg.setText('Updating database...')
         self.dialog.setWindowTitle('Updating Database')
         self.dialog.setWindowModality(QtCore.Qt.ApplicationModal)
-        self.dialog.buttonBox.rejected.connect(self.__update.stop)
+        self.dialog.buttonBox.rejected.connect(self.database.stop_update)
         self.dialog.show()
-        self.database.clear()
-        self.__update.apply_async(load_into_memory=False)
+        self.database.update(block=False, load_into_memory=self.database.loaded)
         self.__update_timer.start()
 
     def save_report(self):
+        """
         path, accepted = QtWidgets.QInputDialog.getText(self, 'Filename',
                                                         'Filename for the generated report (leave blank for default):')
         if not accepted: return
@@ -299,6 +309,9 @@ class MainWindow(Ui_MainWindow):
             show_dialog('Failed to save the scan report. Error: ' + str(e), self, 'Error', error=True)
         else:
             show_dialog(f'Saved scan report to "{path}"', self, 'Success')
+        """
+        # TODO: add function to generate report in scanner
+        raise NotImplementedError
 
     def open_settings(self):
         self.win_settings = SettingsWindow(self.settings)
@@ -325,25 +338,22 @@ class MainWindow(Ui_MainWindow):
         self.win_data_settings.show()
 
     def __update_data_labels(self):
-        loaded = self.database.loaded
-        if self.__is_sig_database:
-            signatures = self.database.signatures
+        signatures = self.database.signatures if self.database.has_signatures else 'N/A'
+        if self.database.updatable:
             version = self.database.version
             update = self.check_update()
         else:
-            signatures = 'N/A'
             version = 'N/A'
             update = 'N/A'
 
         self.win_data_settings.lblSignatures.setText(f'Signatures: {signatures}')
         self.win_data_settings.lblVersion.setText(f'Version: {version}')
-        self.win_data_settings.lblLoaded.setText(f'Database Loaded: {loaded}')
+        self.win_data_settings.lblLoaded.setText(f'Database Loaded: {self.database.loaded}')
         self.win_data_settings.lblUpdate.setText(f'Update Available: {update}')
 
     def _browse_scan_path(self):
         path = file_or_folder_dialog(self)
-        if path:
-            self.txtPath.setText(path)
+        if path: self.txtPath.setText(path)
 
     def _set_status(self, status: str):
         if self.lblStatus.text() != status:
@@ -357,20 +367,40 @@ class MainWindow(Ui_MainWindow):
         else:
             QtWidgets.QApplication.restoreOverrideCursor()
 
-    def start_scan(self, query: ScanQuery = None):
+    def __get_scan_results(self):
+        results = []
+
+        for result in self.scanner.results:
+            results.append(result)
+            for archive_result in result.details.get('archive_files', []):
+                archive_result.path = f'{result.path}->{archive_result.path}'
+                results.append(archive_result)
+
+        return results
+
+    def __update_eta(self):
+        self.lblTimeElapsed.setText(f'Time elapsed: {round(utils.timesince(self.start_time), 2)} s')
+        self.lblTimeElapsed.adjustSize()
+
+    def start_scan(self, scan_func: Callable = None, scan_args: tuple = None):
         if self.scan_running:
             self.finish_scan()
-            return
-
-        path = self.txtPath.text() if query is None else query
-        if isinstance(path, str) and not os.path.exists(path):
-            show_dialog('Invalid directory entered.', self, title='Error', error=True)
             return
 
         if not self.database.loaded:
             show_dialog('Cannot scan because the database is not loaded.',
                         self, title='Database Not Loaded', error=True)
             return
+
+        if not scan_func:
+            path = self.txtPath.text()
+            if not os.path.exists(path):
+                show_dialog('Invalid directory entered.', self, title='Error', error=True)
+                return
+            scan_func = partial(self.scanner.scan_async, [path],
+                                scan_func=self.scanner.normal_scan, scan_subdirs=self.settings['scan_subdirs'])
+        else:
+            scan_func = partial(self.scanner.scan_async, *scan_args, scan_func=scan_func)
 
         self.scan_running = True
         self.lstScanned.clearContents()
@@ -382,45 +412,48 @@ class MainWindow(Ui_MainWindow):
         self.btnStartStop.setText('Stop')
         self.btnStartStop.setEnabled(True)
         self.start_time = time.time()
-        self.scanner.scan_async(path, subdirs=self.settings['scan_subdirs'],
-                                load_while_scanning=self.settings['load_while_scanning'])
+        scan_func(load_paths_while_scanning=self.settings['load_while_scanning'])
         self.__scan_timer.start()
-
-    def __update_timesince(self):
-        self.lblTimeElapsed.setText(f'Time elapsed: {round(utils.timesince(self.start_time), 2)} s')
-        self.lblTimeElapsed.adjustSize()
 
     def __scan_update(self):
         if self.scanner.state == Scanner.STATE_LOAD_PATHS:
-            self._set_status('Preparing...')
+            status = 'Preparing'
         else:
-            self._set_status('Scanning')
+            status = 'Scanning'
 
-        all_files = len(self.scanner.all_files)
+        if self.__status_text == '...':
+            self.__status_text = '.'
+        else:
+            self.__status_text += '.'
+        self._set_status(status + self.__status_text)
 
-        scanned = len(list(filter(lambda x: not x.details.get('in_archive'), self.scanner.results)))
-        total_files = all_files - len(self.scanner.not_scanned)
+        results = self.__get_scan_results()
+        num_results = len(results)
+        num_total_files = len(list(self.scanner.file_iter)) if not self.settings['load_while_scanning'] else num_results
+        num_files_scanned = len(list(filter(lambda x: not x.in_archive, results)))
+        num_threats = len(list(filter(lambda x: x.malicious, results)))
+
         try:
-            self.progressBar.setValue(scanned / total_files * 100)
+            self.progressBar.setValue(num_files_scanned / num_total_files * 100)
         except ZeroDivisionError:
             pass
 
-        self.lblScanned.setText(f'Scanned: {scanned}/{all_files} files ({len(self.scanner.results)} items)')
+        self.lblScanned.setText(f'Scanned: {num_files_scanned}/{num_total_files} files ({num_results} items)')
         self.lblScanned.adjustSize()
-        self.lblThreats.setText(f'Threats: {len(self.scanner.infected)}')
-        self.__update_timesince()
-        remaining = round(utils.estimate_time(total_files, scanned, self.start_time), 1)
+        self.lblThreats.setText(f'Threats: {num_threats}')
+        self.__update_eta()
+
+        remaining = round(utils.estimate_time(num_total_files, num_files_scanned, self.start_time), 1)
         if remaining < 0: remaining = 0
-        self.lblTimeRemaining.setText(
-            f'Remaining: {remaining} s'
-        )
+        self.lblTimeRemaining.setText(f'Remaining: {remaining} s')
 
         font = QtGui.QFont()
         font.setFamily("Trebuchet MS")
         font.setPointSize(10)
         n_displayed = self.lstScanned.rowCount()
 
-        for result in self.scanner.results[n_displayed:]:
+        for result in results[n_displayed:]:
+            print(result)
             item_path = QtWidgets.QTableWidgetItem(result.path)
             item_path.setFont(font)
             item_result = QtWidgets.QTableWidgetItem('infected' if result.malicious else 'clean')
@@ -428,34 +461,38 @@ class MainWindow(Ui_MainWindow):
             self.lstScanned.insertRow(n_displayed)
             self.lstScanned.setItem(n_displayed, 0, item_path)
             self.lstScanned.setItem(n_displayed, 1, item_result)
+
             if result.malicious:
                 item_path = QtWidgets.QTableWidgetItem(result.path)
                 item_path.setFont(font)
-                item_details = QtWidgets.QTableWidgetItem(','.join([f'{str(k)}: {str(v)}' for k, v in
-                                                                    result.details.items()]))
+                item_details = QtWidgets.QTableWidgetItem(
+                    ','.join([f'{str(k)}: {str(v)}' for k, v in result.details.items()])
+                )
                 item_details.setFont(font)
                 row = self.lstThreats.rowCount()
                 self.lstThreats.insertRow(row)
                 self.lstThreats.setItem(row, 0, item_path)
                 self.lstThreats.setItem(row, 1, item_details)
 
-        if n_displayed != len(self.scanner.results):
-            self.lstScanned.resizeRowsToContents()
-            self.lstScanned.resizeColumnToContents(0)
-            self.lstScanned.scrollToBottom()
-            self.lstThreats.resizeColumnToContents(0)
-            self.lstThreats.resizeColumnToContents(1)
-            self.lstThreats.resizeRowsToContents()
-            self.lstThreats.scrollToBottom()
+        self.lstScanned.resizeRowsToContents()
+        self.lstScanned.resizeColumnToContents(0)
+        self.lstScanned.scrollToBottom()
+        self.lstThreats.resizeColumnToContents(0)
+        self.lstThreats.resizeColumnToContents(1)
+        self.lstThreats.resizeRowsToContents()
+        self.lstThreats.scrollToBottom()
 
         if self.scanner.state == Scanner.STATE_IDLE: self.finish_scan()
 
     def finish_scan(self):
         self.__scan_timer.stop()
-        self.__update_timesince()
+        self.__update_eta()
         self.progressBar.setValue(100)
-        self.scanner.stop_scan(block=False)
+        self._set_loading()
+        self.scanner.stop_scan(block=True)
+        self._set_loading(False)
         self.scan_running = False
+        self.__status_text = ''
         self.btnBrowse.setEnabled(True)
         self.btnStartStop.setText('Start')
         self._set_status('Ready')

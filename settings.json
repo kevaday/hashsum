@@ -1,1 +1,0 @@
-{"scan_subdirs": true, "scan_archives": true, "load_while_scanning": false, "scan_workers": 4, "scan_chsz": 0, "scan_load_chsz": 0, "load_on_start": false, "data_workers": 4, "update_chsz": 2, "data_load_chsz": 20000000, "database_type": "MD5 Hash", "use_gpu": true}
